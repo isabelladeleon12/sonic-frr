@@ -1,23 +1,61 @@
 ## Process this file with automake to produce Makefile.in.
 
 AUTOMAKE_OPTIONS = subdir-objects 1.12
-ACLOCAL_AMFLAGS = -I m4
+ACLOCAL_AMFLAGS = -I m4 -Wall,no-override
 
 AM_CFLAGS = \
+	$(AC_CFLAGS) \
 	$(LIBYANG_CFLAGS) \
 	$(SQLITE3_CFLAGS) \
 	$(UNWIND_CFLAGS) \
 	$(SAN_FLAGS) \
 	$(WERROR) \
 	# end
-AM_CPPFLAGS = \
+AM_CXXFLAGS = \
+	$(AC_CXXFLAGS) \
+	$(LIBYANG_CFLAGS) \
+	$(WERROR) \
+	# end
+
+# CPPFLAGS_BASE does not contain the include path for overriding assert.h,
+# therefore should be used in tools that do *not* link libfrr or do not want
+# assert() overridden
+CPPFLAGS_BASE = \
 	-I$(top_srcdir) -I$(top_srcdir)/include -I$(top_srcdir)/lib \
-	-I$(top_builddir) -I$(top_builddir)/include -I$(top_builddir)/lib
+	-I$(top_builddir) \
+	$(LUA_INCLUDE) \
+	# end
+AM_CPPFLAGS = \
+	-I$(top_srcdir)/lib/assert \
+	$(CPPFLAGS_BASE) \
+	# end
+
+# AM_LDFLAGS is used for executables (daemons).  LDFLAGS can be left alone,
+# but if it is changed it should include $(AM_LDFLAGS)
 AM_LDFLAGS = \
+	-export-dynamic \
+	$(AC_LDFLAGS) \
+	$(AC_LDFLAGS_EXEC) \
+	$(SAN_FLAGS) \
+	# end
+
+# libraries need to use libxxx_LDFLAGS = $(LIB_LDFLAGS) -version-info X:Y:Z
+LIB_LDFLAGS = \
 	-export-dynamic \
 	$(AC_LDFLAGS) \
 	$(SAN_FLAGS) \
 	# end
+
+# modules need to use xxx_LDFLAGS = $(MODULE_LDFLAGS)
+MODULE_LDFLAGS = \
+	-export-dynamic \
+	-avoid-version \
+	-module \
+	-shared \
+	$(AC_LDFLAGS) \
+	$(SAN_FLAGS) \
+	# end
+
 DEFS = @DEFS@ -DSYSCONFDIR=\"$(sysconfdir)/\" -DCONFDATE=$(CONFDATE)
 
 AR_FLAGS = @AR_FLAGS@
@@ -37,6 +75,12 @@ shvar-%:
 	@echo "$*=\"$($*)\"" >&$(VARFD)
 var-%:
 	@echo "$($*)" >&$(VARFD)
+
+if ONLY_CLIPPY
+.DEFAULT_GOAL := clippy-only
+endif
+clippy-only: Makefile lib/clippy config.h
+.PHONY: clippy-only
 
 # overwriting these vars breaks cross-compilation.  let's be helpful and warn.
 #
@@ -81,11 +125,11 @@ var-%:
 #AUTODERP# endif
 
 EXTRA_DIST =
+EXTRA_PROGRAMS =
 BUILT_SOURCES =
 CLEANFILES =
 DISTCLEANFILES =
-
-examplesdir = $(exampledir)
+SUFFIXES =
 
 bin_PROGRAMS =
 sbin_PROGRAMS =
@@ -96,13 +140,12 @@ noinst_LIBRARIES =
 nodist_noinst_DATA =
 lib_LTLIBRARIES =
 module_LTLIBRARIES =
-libyang_plugins_LTLIBRARIES =
 pkginclude_HEADERS =
 nodist_pkginclude_HEADERS =
-dist_examples_DATA =
 dist_yangmodels_DATA =
 man_MANS =
-vtysh_scan =
+vtysh_daemons =
+clippy_scan =
 
 ## libtool, the self-made GNU scourge
 ## ... this should fix relinking
@@ -111,7 +154,6 @@ vtysh_scan =
 $(AUTOMAKE_DUMMY)install-moduleLTLIBRARIES: install-libLTLIBRARIES
 $(AUTOMAKE_DUMMY)install-binPROGRAMS: install-libLTLIBRARIES
 $(AUTOMAKE_DUMMY)install-sbinPROGRAMS: install-libLTLIBRARIES
-$(AUTOMAKE_DUMMY)install-libyang_pluginsLTLIBRARIES: install-libLTLIBRARIES
 
 include doc/subdir.am
 include doc/user/subdir.am
@@ -119,12 +161,13 @@ include doc/manpages/subdir.am
 include doc/developer/subdir.am
 include include/subdir.am
 include lib/subdir.am
+include mlag/subdir.am
 include zebra/subdir.am
 include watchfrr/subdir.am
 include qpb/subdir.am
 include fpm/subdir.am
+include grpc/subdir.am
 include tools/subdir.am
-include solaris/subdir.am
 
 include bgpd/subdir.am
 include bgpd/rfp-example/librfp/subdir.am
@@ -146,6 +189,10 @@ include staticd/subdir.am
 include bfdd/subdir.am
 include yang/subdir.am
 include yang/libyang_plugins/subdir.am
+include vrrpd/subdir.am
+include pceplib/subdir.am
+include pceplib/test/subdir.am
+include pathd/subdir.am
 
 include vtysh/subdir.am
 include tests/subdir.am
@@ -169,13 +216,22 @@ EXTRA_DIST += \
 	m4/README.txt \
 	m4/libtool-whole-archive.patch \
 	config.version \
-	changelog-auto \
-	changelog-auto.in \
 	\
 	python/clidef.py \
 	python/clippy/__init__.py \
+	python/clippy/elf.py \
+	python/clippy/uidhash.py \
+	python/makevars.py \
+	python/makefile.py \
+	python/tiabwarfo.py \
+	python/xrelfo.py \
+	python/xref2vtysh.py \
+	python/test_xrelfo.py \
+	python/runtests.py \
 	\
-	redhat/frr.logrotate \
+	python/xrefstructs.json \
+	\
+	tools/etc/logrotate.d/frr \
 	redhat/frr.pam \
 	redhat/frr.spec \
 	\
@@ -187,7 +243,6 @@ EXTRA_DIST += \
 	snapcraft/defaults \
 	snapcraft/helpers \
 	snapcraft/snap \
-	\
 	babeld/Makefile \
 	bgpd/Makefile \
 	bgpd/rfp-example/librfp/Makefile \
@@ -198,6 +253,7 @@ EXTRA_DIST += \
 	doc/user/Makefile \
 	eigrpd/Makefile \
 	fpm/Makefile \
+	grpc/Makefile \
 	isisd/Makefile \
 	ldpd/Makefile \
 	lib/Makefile \
@@ -216,15 +272,50 @@ EXTRA_DIST += \
 	vtysh/Makefile \
 	watchfrr/Makefile \
 	zebra/Makefile \
+	vrrpd/Makefile \
 	# end
 
-noinst_HEADERS += defaults.h
+AM_V_LLVM_BC = $(am__v_LLVM_BC_$(V))
+am__v_LLVM_BC_ = $(am__v_LLVM_BC_$(AM_DEFAULT_VERBOSITY))
+am__v_LLVM_BC_0 = @echo "  LLVM.BC " $@;
+am__v_LLVM_BC_1 = 
 
-clean-local: clean-python
-.PHONY: clean-python
+AM_V_LLVM_LD = $(am__v_LLVM_LD_$(V))
+am__v_LLVM_LD_ = $(am__v_LLVM_LD_$(AM_DEFAULT_VERBOSITY))
+am__v_LLVM_LD_0 = @echo "  LLVM.LD " $@;
+am__v_LLVM_LD_1 = 
+
+SUFFIXES += .lo.bc .o.bc
+
+.o.o.bc:
+	$(AM_V_LLVM_BC)$(COMPILE) -emit-llvm -c -o $@ $(patsubst %.o,%.c,$<)
+.lo.lo.bc:
+	$(AM_V_LLVM_BC)$(COMPILE) -emit-llvm -c -o $@ $(patsubst %.lo,%.c,$<)
+
+%.cg.json: %.bc tools/frr-llvm-cg
+	tools/frr-llvm-cg -o $@ $<
+%.cg.dot: %.cg.json
+	$(PYTHON) $(top_srcdir)/python/callgraph-dot.py $< $@
+%.cg.svg: %.cg.dot
+	@echo if the following command fails, you need to install graphviz.
+	@echo also, the output is nondeterministic. run it multiple times and use the nicest output.
+	@echo tuning parameters may yield nicer looking graphs as well.
+	fdp -GK=0.7 -Gstart=42231337 -Gmaxiter=2000 -Elen=2 -Gnodesep=1.5 -Tsvg -o$@ $<
+# don't delete intermediaries
+.PRECIOUS: %.cg.json %.cg.dot
+
+# <lib>.la.bc, <lib>.a.bc and <daemon>.bc targets are generated by
+# python/makefile.py
+LLVM_LINK = llvm-link-$(llvm_version)
+
+clean-local: clean-python clean-llvm-bitcode
+.PHONY: clean-python clean-llvm-bitcode
 clean-python:
 	find . -name __pycache__ -o -name .pytest_cache | xargs rm -rf
 	find . -name "*.pyc" -o -name "*_clippy.c" | xargs rm -f
+
+clean-llvm-bitcode:
+	find . -name "*.bc" -o -name "*.cg.json" -o -name "*.cg.dot" -o -name "*.cg.svg" | xargs rm -f
 
 redistclean:
 	$(MAKE) distclean CONFIG_CLEAN_FILES="$(filter-out $(EXTRA_DIST), $(CONFIG_CLEAN_FILES))"

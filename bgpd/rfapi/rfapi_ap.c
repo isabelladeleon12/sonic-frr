@@ -81,10 +81,10 @@
  * is used to spread out the sort for adbs with the same lifetime
  * and thereby make the skip list operations more efficient.
  */
-static int sl_adb_lifetime_cmp(void *adb1, void *adb2)
+static int sl_adb_lifetime_cmp(const void *adb1, const void *adb2)
 {
-	struct rfapi_adb *a1 = adb1;
-	struct rfapi_adb *a2 = adb2;
+	const struct rfapi_adb *a1 = adb1;
+	const struct rfapi_adb *a2 = adb2;
 
 	if (a1->lifetime < a2->lifetime)
 		return -1;
@@ -459,7 +459,6 @@ int rfapiApAdd(struct bgp *bgp, struct rfapi_descriptor *rfd,
 	if (rc) {
 		/* Not found */
 		adb = XCALLOC(MTYPE_RFAPI_ADB, sizeof(struct rfapi_adb));
-		assert(adb);
 		adb->lifetime = lifetime;
 		adb->u.key = rk;
 

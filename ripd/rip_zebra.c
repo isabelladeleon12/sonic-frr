@@ -88,18 +88,16 @@ static void rip_zebra_ipv4_send(struct rip *rip, struct route_node *rp,
 
 	if (IS_RIP_DEBUG_ZEBRA) {
 		if (rip->ecmp)
-			zlog_debug("%s: %s/%d nexthops %d",
+			zlog_debug("%s: %pFX nexthops %d",
 				   (cmd == ZEBRA_ROUTE_ADD)
 					   ? "Install into zebra"
 					   : "Delete from zebra",
-				   inet_ntoa(rp->p.u.prefix4), rp->p.prefixlen,
-				   count);
+				   &rp->p, count);
 		else
-			zlog_debug("%s: %s/%d",
+			zlog_debug("%s: %pFX",
 				   (cmd == ZEBRA_ROUTE_ADD)
 					   ? "Install into zebra"
-					   : "Delete from zebra",
-				   inet_ntoa(rp->p.u.prefix4), rp->p.prefixlen);
+					   : "Delete from zebra", &rp->p);
 	}
 
 	rip->counters.route_changes++;
@@ -118,8 +116,7 @@ void rip_zebra_ipv4_delete(struct rip *rip, struct route_node *rp)
 }
 
 /* Zebra route add and delete treatment. */
-static int rip_zebra_read_route(int command, struct zclient *zclient,
-				zebra_size_t length, vrf_id_t vrf_id)
+static int rip_zebra_read_route(ZAPI_CALLBACK_ARGS)
 {
 	struct rip *rip;
 	struct zapi_route api;
@@ -138,11 +135,11 @@ static int rip_zebra_read_route(int command, struct zclient *zclient,
 	nh.ifindex = api.nexthops[0].ifindex;
 
 	/* Then fetch IPv4 prefixes. */
-	if (command == ZEBRA_REDISTRIBUTE_ROUTE_ADD)
+	if (cmd == ZEBRA_REDISTRIBUTE_ROUTE_ADD)
 		rip_redistribute_add(rip, api.type, RIP_ROUTE_REDISTRIBUTE,
 				     (struct prefix_ipv4 *)&api.prefix, &nh,
 				     api.metric, api.distance, api.tag);
-	else if (command == ZEBRA_REDISTRIBUTE_ROUTE_DEL)
+	else if (cmd == ZEBRA_REDISTRIBUTE_ROUTE_DEL)
 		rip_redistribute_delete(rip, api.type, RIP_ROUTE_REDISTRIBUTE,
 					(struct prefix_ipv4 *)&api.prefix,
 					nh.ifindex);
@@ -152,8 +149,8 @@ static int rip_zebra_read_route(int command, struct zclient *zclient,
 
 void rip_redistribute_conf_update(struct rip *rip, int type)
 {
-	zclient_redistribute(ZEBRA_REDISTRIBUTE_ADD, zclient, AFI_IP, type,
-			     0, rip->vrf->vrf_id);
+	zebra_redistribute_send(ZEBRA_REDISTRIBUTE_ADD, zclient, AFI_IP,
+				type, 0, rip->vrf->vrf_id);
 }
 
 void rip_redistribute_conf_delete(struct rip *rip, int type)
@@ -233,21 +230,21 @@ static void rip_zebra_connected(struct zclient *zclient)
 	zclient_send_reg_requests(zclient, VRF_DEFAULT);
 }
 
+zclient_handler *const rip_handlers[] = {
+	[ZEBRA_INTERFACE_ADDRESS_ADD] = rip_interface_address_add,
+	[ZEBRA_INTERFACE_ADDRESS_DELETE] = rip_interface_address_delete,
+	[ZEBRA_INTERFACE_VRF_UPDATE] = rip_interface_vrf_update,
+	[ZEBRA_REDISTRIBUTE_ROUTE_ADD] = rip_zebra_read_route,
+	[ZEBRA_REDISTRIBUTE_ROUTE_DEL] = rip_zebra_read_route,
+};
+
 void rip_zclient_init(struct thread_master *master)
 {
 	/* Set default value to the zebra client structure. */
-	zclient = zclient_new(master, &zclient_options_default);
+	zclient = zclient_new(master, &zclient_options_default, rip_handlers,
+			      array_size(rip_handlers));
 	zclient_init(zclient, ZEBRA_ROUTE_RIP, 0, &ripd_privs);
 	zclient->zebra_connected = rip_zebra_connected;
-	zclient->interface_add = rip_interface_add;
-	zclient->interface_delete = rip_interface_delete;
-	zclient->interface_address_add = rip_interface_address_add;
-	zclient->interface_address_delete = rip_interface_address_delete;
-	zclient->interface_up = rip_interface_up;
-	zclient->interface_down = rip_interface_down;
-	zclient->interface_vrf_update = rip_interface_vrf_update;
-	zclient->redistribute_route_add = rip_zebra_read_route;
-	zclient->redistribute_route_del = rip_zebra_read_route;
 }
 
 void rip_zclient_stop(void)

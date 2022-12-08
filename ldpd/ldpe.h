@@ -28,9 +28,7 @@
 #endif
 
 #include "ldpd.h"
-
-#define min(x,y) ((x) <= (y) ? (x) : (y))
-#define max(x,y) ((x) > (y) ? (x) : (y))
+#include "lib/ldp_sync.h"
 
 /* forward declarations */
 TAILQ_HEAD(mapping_head, mapping_entry);
@@ -92,7 +90,7 @@ struct nbr {
 	struct in_addr		 id;		/* lsr id */
 	union ldpd_addr		 laddr;		/* local address */
 	union ldpd_addr		 raddr;		/* remote address */
-	uint32_t		 raddr_scope;	/* remote address scope (v6) */
+	ifindex_t		 raddr_scope;	/* remote address scope (v6) */
 	time_t			 uptime;
 	int			 fd;
 	int			 state;
@@ -150,7 +148,7 @@ extern struct nbr_pid_head	 nbrs_by_pid;
 
 /* accept.c */
 void	accept_init(void);
-int	accept_add(int, int (*)(struct thread *), void *);
+int accept_add(int, void (*)(struct thread *), void *);
 void	accept_del(int);
 void	accept_pause(void);
 void	accept_unpause(void);
@@ -208,18 +206,20 @@ void		 ldpe_reset_ds_nbrs(void);
 void		 ldpe_remove_dynamic_tnbrs(int);
 void		 ldpe_stop_init_backoff(int);
 struct ctl_conn;
-void		 ldpe_iface_ctl(struct ctl_conn *, unsigned int);
+void		 ldpe_iface_ctl(struct ctl_conn *c, ifindex_t ifidx);
 void		 ldpe_adj_ctl(struct ctl_conn *);
 void		 ldpe_adj_detail_ctl(struct ctl_conn *);
 void		 ldpe_nbr_ctl(struct ctl_conn *);
+void		 ldpe_ldp_sync_ctl(struct ctl_conn *);
 void		 mapping_list_add(struct mapping_head *, struct map *);
 void		 mapping_list_clr(struct mapping_head *);
+void		 ldpe_set_config_change_time(void);
 
 /* interface.c */
 struct iface	*if_new(const char *);
 void		 ldpe_if_init(struct iface *);
 void		 ldpe_if_exit(struct iface *);
-struct iface	*if_lookup(struct ldpd_conf *, unsigned short);
+struct iface	*if_lookup(struct ldpd_conf *c, ifindex_t ifidx);
 struct iface	*if_lookup_name(struct ldpd_conf *, const char *);
 void		 if_update_info(struct iface *, struct kif *);
 struct iface_af *iface_af_get(struct iface *, int);
@@ -229,8 +229,17 @@ void		 ldp_if_update(struct iface *, int);
 void		 if_update_all(int);
 uint16_t	 if_get_hello_holdtime(struct iface_af *);
 uint16_t	 if_get_hello_interval(struct iface_af *);
+uint16_t	 if_get_wait_for_sync_interval(void);
 struct ctl_iface *if_to_ctl(struct iface_af *);
 in_addr_t	 if_get_ipv4_addr(struct iface *);
+int		 ldp_sync_fsm_adj_event(struct adj *, enum ldp_sync_event);
+int		 ldp_sync_fsm_nbr_event(struct nbr *, enum ldp_sync_event);
+int		 ldp_sync_fsm_state_req(struct ldp_igp_sync_if_state_req *);
+int		 ldp_sync_fsm(struct iface *, enum ldp_sync_event);
+void		 ldp_sync_fsm_reset_all(void);
+const char      *ldp_sync_state_name(int);
+const char      *ldp_sync_event_name(int);
+struct ctl_ldp_sync *ldp_sync_to_ctl(struct iface *);
 
 /* adjacency.c */
 struct adj	*adj_new(struct in_addr, struct hello_source *,
@@ -255,6 +264,8 @@ struct nbr		*nbr_new(struct in_addr, int, int, union ldpd_addr *,
 			    uint32_t);
 void			 nbr_del(struct nbr *);
 struct nbr		*nbr_find_ldpid(uint32_t);
+struct nbr		*nbr_get_first_ldpid(void);
+struct nbr		*nbr_get_next_ldpid(uint32_t);
 struct nbr		*nbr_find_addr(int, union ldpd_addr *);
 struct nbr		*nbr_find_peerid(uint32_t);
 int			 nbr_adj_count(struct nbr *, int);
@@ -281,8 +292,8 @@ int			 gen_ldp_hdr(struct ibuf *, uint16_t);
 int			 gen_msg_hdr(struct ibuf *, uint16_t, uint16_t);
 int			 send_packet(int, int, union ldpd_addr *,
 			    struct iface_af *, void *, size_t);
-int			 disc_recv_packet(struct thread *);
-int			 session_accept(struct thread *);
+void disc_recv_packet(struct thread *thread);
+void session_accept(struct thread *thread);
 void			 session_accept_nbr(struct nbr *, int);
 void			 session_shutdown(struct nbr *, uint32_t, uint32_t,
 			    uint32_t);
@@ -291,7 +302,7 @@ struct tcp_conn		*tcp_new(int, struct nbr *);
 void			 pending_conn_del(struct pending_conn *);
 struct pending_conn	*pending_conn_find(int, union ldpd_addr *);
 
-char	*pkt_ptr;	/* packet buffer */
+extern char *pkt_ptr; /* packet buffer */
 
 /* pfkey.c */
 #ifdef __OpenBSD__
@@ -306,5 +317,8 @@ void	ldpe_l2vpn_init(struct l2vpn *);
 void	ldpe_l2vpn_exit(struct l2vpn *);
 void	ldpe_l2vpn_pw_init(struct l2vpn_pw *);
 void	ldpe_l2vpn_pw_exit(struct l2vpn_pw *);
+
+DECLARE_HOOK(ldp_nbr_state_change, (struct nbr * nbr, int old_state),
+	     (nbr, old_state));
 
 #endif	/* _LDPE_H_ */

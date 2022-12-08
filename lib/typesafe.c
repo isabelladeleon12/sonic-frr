@@ -14,14 +14,61 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 #include "typesafe.h"
 #include "memory.h"
+#include "network.h"
 
-DEFINE_MTYPE_STATIC(LIB, TYPEDHASH_BUCKET, "Typed-hash bucket")
-DEFINE_MTYPE_STATIC(LIB, SKIPLIST_OFLOW, "Skiplist overflow")
+DEFINE_MTYPE_STATIC(LIB, TYPEDHASH_BUCKET, "Typed-hash bucket");
+DEFINE_MTYPE_STATIC(LIB, SKIPLIST_OFLOW, "Skiplist overflow");
+DEFINE_MTYPE_STATIC(LIB, HEAP_ARRAY, "Typed-heap array");
+
+struct slist_item typesafe_slist_sentinel = { NULL };
+
+bool typesafe_list_member(const struct slist_head *head,
+			  const struct slist_item *item)
+{
+	struct slist_item *fromhead = head->first;
+	struct slist_item **fromnext = (struct slist_item **)&item->next;
+
+	while (fromhead != _SLIST_LAST) {
+		if (fromhead == item || fromnext == head->last_next)
+			return true;
+
+		fromhead = fromhead->next;
+		if (!*fromnext || *fromnext == _SLIST_LAST)
+			break;
+		fromnext = &(*fromnext)->next;
+	}
+
+	return false;
+}
+
+bool typesafe_dlist_member(const struct dlist_head *head,
+			   const struct dlist_item *item)
+{
+	const struct dlist_item *fromhead = head->hitem.next;
+	const struct dlist_item *fromitem = item->next;
+
+	if (!item->prev || !item->next)
+		return false;
+
+	while (fromhead != &head->hitem && fromitem != item) {
+		if (fromitem == &head->hitem || fromhead == item)
+			return true;
+		fromhead = fromhead->next;
+		fromitem = fromitem->next;
+	}
+
+	return false;
+}
 
 #if 0
 static void hash_consistency_check(struct thash_head *head)
@@ -152,7 +199,7 @@ void typesafe_hash_shrink(struct thash_head *head)
 
 /* skiplist */
 
-static inline struct sskip_item *sl_level_get(struct sskip_item *item,
+static inline struct sskip_item *sl_level_get(const struct sskip_item *item,
 			size_t level)
 {
 	if (level < SKIPLIST_OVERFLOW)
@@ -191,7 +238,7 @@ struct sskip_item *typesafe_skiplist_add(struct sskip_head *head,
 	int cmpval;
 
 	/* level / newlevel are 1-counted here */
-	newlevel = __builtin_ctz(random()) + 1;
+	newlevel = __builtin_ctz(frr_weak_random()) + 1;
 	if (newlevel > SKIPLIST_MAXDEPTH)
 		newlevel = SKIPLIST_MAXDEPTH;
 
@@ -257,13 +304,14 @@ struct sskip_item *typesafe_skiplist_add(struct sskip_head *head,
 
 /* NOTE: level counting below is 1-based since that makes the code simpler! */
 
-struct sskip_item *typesafe_skiplist_find(struct sskip_head *head,
+const struct sskip_item *typesafe_skiplist_find(
+		const struct sskip_head *head,
 		const struct sskip_item *item, int (*cmpfn)(
 				const struct sskip_item *a,
 				const struct sskip_item *b))
 {
 	size_t level = SKIPLIST_MAXDEPTH;
-	struct sskip_item *prev = &head->hitem, *next;
+	const struct sskip_item *prev = &head->hitem, *next;
 	int cmpval;
 
 	while (level) {
@@ -284,13 +332,14 @@ struct sskip_item *typesafe_skiplist_find(struct sskip_head *head,
 	return NULL;
 }
 
-struct sskip_item *typesafe_skiplist_find_gteq(struct sskip_head *head,
+const struct sskip_item *typesafe_skiplist_find_gteq(
+		const struct sskip_head *head,
 		const struct sskip_item *item, int (*cmpfn)(
 				const struct sskip_item *a,
 				const struct sskip_item *b))
 {
 	size_t level = SKIPLIST_MAXDEPTH;
-	struct sskip_item *prev = &head->hitem, *next;
+	const struct sskip_item *prev = &head->hitem, *next;
 	int cmpval;
 
 	while (level) {
@@ -311,13 +360,14 @@ struct sskip_item *typesafe_skiplist_find_gteq(struct sskip_head *head,
 	return next;
 }
 
-struct sskip_item *typesafe_skiplist_find_lt(struct sskip_head *head,
+const struct sskip_item *typesafe_skiplist_find_lt(
+		const struct sskip_head *head,
 		const struct sskip_item *item, int (*cmpfn)(
 				const struct sskip_item *a,
 				const struct sskip_item *b))
 {
 	size_t level = SKIPLIST_MAXDEPTH;
-	struct sskip_item *prev = &head->hitem, *next, *best = NULL;
+	const struct sskip_item *prev = &head->hitem, *next, *best = NULL;
 	int cmpval;
 
 	while (level) {
@@ -336,13 +386,14 @@ struct sskip_item *typesafe_skiplist_find_lt(struct sskip_head *head,
 	return best;
 }
 
-void typesafe_skiplist_del(struct sskip_head *head, struct sskip_item *item,
-		int (*cmpfn)(const struct sskip_item *a,
-				const struct sskip_item *b))
+struct sskip_item *typesafe_skiplist_del(
+	struct sskip_head *head, struct sskip_item *item,
+	int (*cmpfn)(const struct sskip_item *a, const struct sskip_item *b))
 {
 	size_t level = SKIPLIST_MAXDEPTH;
 	struct sskip_item *prev = &head->hitem, *next;
 	int cmpval;
+	bool found = false;
 
 	while (level) {
 		next = sl_level_get(prev, level - 1);
@@ -354,6 +405,7 @@ void typesafe_skiplist_del(struct sskip_head *head, struct sskip_item *item,
 			sl_level_set(prev, level - 1,
 				sl_level_get(item, level - 1));
 			level--;
+			found = true;
 			continue;
 		}
 		cmpval = cmpfn(next, item);
@@ -363,6 +415,9 @@ void typesafe_skiplist_del(struct sskip_head *head, struct sskip_item *item,
 		}
 		level--;
 	}
+
+	if (!found)
+		return NULL;
 
 	/* TBD: assert when trying to remove non-existing item? */
 	head->count--;
@@ -374,4 +429,183 @@ void typesafe_skiplist_del(struct sskip_head *head, struct sskip_item *item,
 		XFREE(MTYPE_SKIPLIST_OFLOW, oflow);
 	}
 	memset(item, 0, sizeof(*item));
+
+	return item;
+}
+
+struct sskip_item *typesafe_skiplist_pop(struct sskip_head *head)
+{
+	size_t level = SKIPLIST_MAXDEPTH;
+	struct sskip_item *prev = &head->hitem, *next, *item;
+
+	item = sl_level_get(prev, 0);
+	if (!item)
+		return NULL;
+
+	do {
+		level--;
+
+		next = sl_level_get(prev, level);
+		if (next != item)
+			continue;
+
+		sl_level_set(prev, level, sl_level_get(item, level));
+	} while (level);
+
+	head->count--;
+
+	if ((uintptr_t)item->next[SKIPLIST_OVERFLOW] & 1) {
+		uintptr_t ptrval = (uintptr_t)item->next[SKIPLIST_OVERFLOW];
+		ptrval &= UINTPTR_MAX - 3;
+		struct sskip_overflow *oflow = (struct sskip_overflow *)ptrval;
+		XFREE(MTYPE_SKIPLIST_OFLOW, oflow);
+	}
+	memset(item, 0, sizeof(*item));
+
+	return item;
+}
+
+/* heap */
+
+#if 0
+static void heap_consistency_check(struct heap_head *head,
+				   int (*cmpfn)(const struct heap_item *a,
+						const struct heap_item *b),
+				   uint32_t pos)
+{
+	uint32_t rghtpos = pos + 1;
+	uint32_t downpos = HEAP_NARY * (pos + 1);
+
+	if (pos + 1 > ~0U / HEAP_NARY)
+		downpos = ~0U;
+
+	if ((pos & (HEAP_NARY - 1)) != HEAP_NARY - 1 && rghtpos < head->count) {
+		assert(cmpfn(head->array[rghtpos], head->array[pos]) >= 0);
+		heap_consistency_check(head, cmpfn, rghtpos);
+	}
+	if (downpos < head->count) {
+		assert(cmpfn(head->array[downpos], head->array[pos]) >= 0);
+		heap_consistency_check(head, cmpfn, downpos);
+	}
+}
+#else
+#define heap_consistency_check(head, cmpfn, pos)
+#endif
+
+void typesafe_heap_resize(struct heap_head *head, bool grow)
+{
+	uint32_t newsize;
+
+	if (grow) {
+		newsize = head->arraysz;
+		if (newsize <= 36)
+			newsize = 72;
+		else if (newsize < 262144)
+			newsize += newsize / 2;
+		else if (newsize < 0xaaaa0000)
+			newsize += newsize / 3;
+		else
+			assert(!newsize);
+	} else if (head->count > 0) {
+		newsize = head->count;
+	} else {
+		XFREE(MTYPE_HEAP_ARRAY, head->array);
+		head->arraysz = 0;
+		return;
+	}
+
+	newsize += HEAP_NARY - 1;
+	newsize &= ~(HEAP_NARY - 1);
+	if (newsize == head->arraysz)
+		return;
+
+	head->array = XREALLOC(MTYPE_HEAP_ARRAY, head->array,
+			       newsize * sizeof(struct heap_item *));
+	head->arraysz = newsize;
+}
+
+void typesafe_heap_pushdown(struct heap_head *head, uint32_t pos,
+		struct heap_item *item,
+		int (*cmpfn)(const struct heap_item *a,
+			     const struct heap_item *b))
+{
+	uint32_t rghtpos, downpos, moveto;
+
+	while (1) {
+		/* rghtpos: neighbor to the "right", inside block of NARY.
+		 *          may be invalid if last in block, check nary_last()
+		 * downpos: first neighbor in the "downwards" block further
+		 *          away from the root
+		 */
+		rghtpos = pos + 1;
+
+		/* make sure we can use the full 4G items */
+		downpos = HEAP_NARY * (pos + 1);
+		if (pos + 1 > ~0U / HEAP_NARY)
+			/* multiplication overflowed.  ~0U is guaranteed
+			 * to be an invalid index; size limit is enforced in
+			 * resize()
+			 */
+			downpos = ~0U;
+
+		/* only used on break */
+		moveto = pos;
+
+#define nary_last(x) (((x) & (HEAP_NARY - 1)) == HEAP_NARY - 1)
+		if (downpos >= head->count
+		    || cmpfn(head->array[downpos], item) >= 0) {
+			/* not moving down; either at end or down is >= item */
+			if (nary_last(pos) || rghtpos >= head->count
+			    || cmpfn(head->array[rghtpos], item) >= 0)
+				/* not moving right either - got our spot */
+				break;
+
+			moveto = rghtpos;
+
+		/* else: downpos is valid and < item.  choose between down
+		 * or right (if the latter is an option) */
+		} else if (nary_last(pos) || cmpfn(head->array[rghtpos],
+						   head->array[downpos]) >= 0)
+			moveto = downpos;
+		else
+			moveto = rghtpos;
+#undef nary_last
+
+		head->array[pos] = head->array[moveto];
+		head->array[pos]->index = pos;
+		pos = moveto;
+	}
+
+	head->array[moveto] = item;
+	item->index = moveto;
+
+	heap_consistency_check(head, cmpfn, 0);
+}
+
+void typesafe_heap_pullup(struct heap_head *head, uint32_t pos,
+		struct heap_item *item,
+		int (*cmpfn)(const struct heap_item *a,
+			     const struct heap_item *b))
+{
+	uint32_t moveto;
+
+	while (pos != 0) {
+		if ((pos & (HEAP_NARY - 1)) == 0)
+			moveto = pos / HEAP_NARY - 1;
+		else
+			moveto = pos - 1;
+
+		if (cmpfn(head->array[moveto], item) <= 0)
+			break;
+
+		head->array[pos] = head->array[moveto];
+		head->array[pos]->index = pos;
+
+		pos = moveto;
+	}
+
+	head->array[pos] = item;
+	item->index = pos;
+
+	heap_consistency_check(head, cmpfn, 0);
 }

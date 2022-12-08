@@ -17,9 +17,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
+#include <zebra.h>
 
 #ifdef __linux__
 
@@ -28,7 +26,6 @@
 #include "checksum.h"
 #include "prefix.h"
 #include "mtracebis_routeget.h"
-
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -66,13 +63,14 @@ static void version(void)
 static void print_host(struct in_addr addr)
 {
 	struct hostent *h;
+	char buf[PREFIX_STRLEN];
 
 	h = gethostbyaddr(&addr, sizeof(addr), AF_INET);
 	if (h == NULL)
 		printf("?");
 	else
 		printf("%s", h->h_name);
-	printf(" (%s) ", inet_ntoa(addr));
+	printf(" (%s) ", inet_ntop(AF_INET, &addr, buf, sizeof(buf)));
 }
 
 static void print_line_no(int i)
@@ -110,7 +108,7 @@ static const char *rtg_proto_str(enum mtrace_rtg_proto proto)
 	case MTRACE_RTG_PROTO_PIM_ASSERT:
 		return "PIM assert";
 	default:
-		sprintf(buf, "unknown protocol (%d)", proto);
+		snprintf(buf, sizeof(buf), "unknown protocol (%d)", proto);
 		return buf;
 	}
 }
@@ -163,7 +161,7 @@ static const char *fwd_code_str(enum mtrace_fwd_code code)
 	case MTRACE_FWD_CODE_ADMIN_PROHIB:
 		return "admin. prohib.";
 	default:
-		sprintf(buf, "unknown fwd. code (%d)", code);
+		snprintf(buf, sizeof(buf), "unknown fwd. code (%d)", code);
 		return buf;
 	}
 }
@@ -450,7 +448,7 @@ int main(int argc, char *const argv[])
 		exit(EXIT_FAILURE);
 	}
 
-	mc_group.s_addr = 0;
+	mc_group.s_addr = INADDR_ANY;
 	not_group = false;
 
 	if (argc == 3) {

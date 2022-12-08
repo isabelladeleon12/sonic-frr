@@ -4,7 +4,7 @@
  * Copyright (C) 2017 by David Lamparter & Christian Franke,
  *                       Open Source Routing / NetDEF Inc.
  *
- * This file is part of FreeRangeRouting (FRR)
+ * This file is part of FRRouting (FRR)
  *
  * FRR is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -34,12 +34,7 @@
  * should be added by autoconf if not present?
  */
 #ifndef s6_addr32
-#if defined(SUNOS_5)
-/* Some SunOS define s6_addr32 only to kernel */
-#define s6_addr32 _S6_un._S6_u32
-#else
 #define s6_addr32 __u6_addr.__u6_addr32
-#endif /* SUNOS_5 */
 #endif /*s6_addr32*/
 
 struct thread_master *master;
@@ -81,9 +76,9 @@ static char *format_srcdest(const struct prefix_ipv6 *dst_p,
 	return rv;
 }
 
-static unsigned int log_key(void *data)
+static unsigned int log_key(const void *data)
 {
-	struct prefix *hash_entry = data;
+	const struct prefix *hash_entry = data;
 	struct prefix_ipv6 *dst_p = (struct prefix_ipv6 *)&hash_entry[0];
 	struct prefix_ipv6 *src_p = (struct prefix_ipv6 *)&hash_entry[1];
 	unsigned int hash = 0;
@@ -165,7 +160,7 @@ static void test_state_add_route(struct test_state *test,
 	}
 
 	rn->info = (void *)0xdeadbeef;
-	hash_get(test->log, hash_entry, log_alloc);
+	(void)hash_get(test->log, hash_entry, log_alloc);
 };
 
 static void test_state_del_route(struct test_state *test,
@@ -276,7 +271,7 @@ static void test_state_verify(struct test_state *test)
 						       associated with rn */
 				expected_lock++;
 
-			if (rn->lock != expected_lock)
+			if (route_node_get_lock_count(rn) != expected_lock)
 				test_failed(
 					test,
 					"Dest rnode lock count doesn't match expected count!",
@@ -288,7 +283,7 @@ static void test_state_verify(struct test_state *test)
 			    != NULL) /* The route node is not internal */
 				expected_lock++;
 
-			if (rn->lock != expected_lock) {
+			if (route_node_get_lock_count(rn) != expected_lock) {
 				srcdest_rnode_prefixes(
 					rn, (const struct prefix **)&dst_p,
 					(const struct prefix **)&src_p);
@@ -333,7 +328,7 @@ static void get_rand_prefix(struct prng *prng, struct prefix_ipv6 *p)
 	p->prefixlen = prng_rand(prng) % 129;
 	p->family = AF_INET6;
 
-	apply_mask((struct prefix *)p);
+	apply_mask(p);
 }
 
 static void get_rand_prefix_pair(struct prng *prng, struct prefix_ipv6 *dst_p,
@@ -391,8 +386,7 @@ static void test_state_del_one_route(struct test_state *test, struct prng *prng)
 	}
 
 	assert(rn);
-	srcdest_rnode_prefixes(rn, (const struct prefix **)&dst_p,
-			       (const struct prefix **)&src_p);
+	srcdest_rnode_prefixes(rn, &dst_p, &src_p);
 	memcpy(&dst6_p, dst_p, sizeof(dst6_p));
 	if (src_p)
 		memcpy(&src6_p, src_p, sizeof(src6_p));

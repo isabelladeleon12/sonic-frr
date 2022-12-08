@@ -22,7 +22,16 @@
 #define _ZEBRA_VTY_H
 
 #include <sys/types.h>
+#ifdef HAVE_LIBPCRE2_POSIX
+#ifndef _FRR_PCRE2_POSIX
+#define _FRR_PCRE2_POSIX
+#include <pcre2posix.h>
+#endif /* _FRR_PCRE2_POSIX */
+#elif defined(HAVE_LIBPCREPOSIX)
+#include <pcreposix.h>
+#else
 #include <regex.h>
+#endif /* HAVE_LIBPCRE2_POSIX */
 
 #include "thread.h"
 #include "log.h"
@@ -30,16 +39,19 @@
 #include "qobj.h"
 #include "compiler.h"
 #include "northbound.h"
+#include "zlog_live.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+struct json_object;
+
 #define VTY_BUFSIZ 4096
 #define VTY_MAXHIST 20
 #define VTY_MAXDEPTH 8
 
-#define VTY_MAXCFGCHANGES 8
+#define VTY_MAXCFGCHANGES 16
 
 struct vty_error {
 	char error_buf[VTY_BUFSIZ];
@@ -52,8 +64,12 @@ struct vty_cfg_change {
 	const char *value;
 };
 
+PREDECL_DLIST(vtys);
+
 /* VTY struct. */
 struct vty {
+	struct vtys_item itm;
+
 	/* File descripter of this vty. */
 	int fd;
 
@@ -130,6 +146,13 @@ struct vty {
 	/* Base candidate configuration. */
 	struct nb_config *candidate_config_base;
 
+	/* Dynamic transaction information. */
+	bool pending_allowed;
+	bool pending_commit;
+	char *pending_cmds_buf;
+	size_t pending_cmds_buflen;
+	size_t pending_cmds_bufpos;
+
 	/* Confirmed-commit timeout and rollback configuration. */
 	struct thread *t_confirmed_commit_timeout;
 	struct nb_config *confirmed_commit_rollback;
@@ -144,7 +167,22 @@ struct vty {
 	unsigned char escape;
 
 	/* Current vty status. */
-	enum { VTY_NORMAL, VTY_CLOSE, VTY_MORE, VTY_MORELINE } status;
+	enum {
+		VTY_NORMAL,
+		VTY_CLOSE,
+		VTY_MORE,
+		VTY_MORELINE,
+		VTY_PASSFD,
+	} status;
+
+	/* vtysh socket/fd passing (for terminal monitor) */
+	int pass_fd;
+
+	/* CLI command return value (likely CMD_SUCCESS) when pass_fd != -1 */
+	uint8_t pass_fd_status[4];
+
+	/* live logging target / terminal monitor */
+	struct zlog_live_cfg live_log;
 
 	/* IAC handling: was the last character received the
 	   IAC (interpret-as-command) escape character (and therefore the next
@@ -168,9 +206,6 @@ struct vty {
 
 	/* Configure lines. */
 	int lines;
-
-	/* Terminal monitor. */
-	int monitor;
 
 	/* Read and write thread. */
 	struct thread *t_read;
@@ -236,6 +271,15 @@ static inline void vty_push_context(struct vty *vty, int node, uint64_t id)
 	struct structname *ptr = VTY_GET_CONTEXT(structname);                  \
 	VTY_CHECK_CONTEXT(ptr);
 
+#define VTY_DECLVAR_CONTEXT_VRF(vrfptr)                                        \
+	struct vrf *vrfptr;                                                    \
+	if (vty->node == CONFIG_NODE)                                          \
+		vrfptr = vrf_lookup_by_id(VRF_DEFAULT);                        \
+	else                                                                   \
+		vrfptr = VTY_GET_CONTEXT(vrf);                                 \
+	VTY_CHECK_CONTEXT(vrfptr);                                             \
+	MACRO_REQUIRE_SEMICOLON() /* end */
+
 /* XPath macros. */
 #define VTY_PUSH_XPATH(nodeval, value)                                         \
 	do {                                                                   \
@@ -254,7 +298,8 @@ static inline void vty_push_context(struct vty *vty, int node, uint64_t id)
 
 #define VTY_CHECK_XPATH                                                        \
 	do {                                                                   \
-		if (vty->xpath_index > 0                                       \
+		if (vty->type != VTY_FILE && !vty->private_config              \
+		    && vty->xpath_index > 0                                    \
 		    && !yang_dnode_exists(vty->candidate_config->dnode,        \
 					  VTY_CURR_XPATH)) {                   \
 			vty_out(vty,                                           \
@@ -289,11 +334,8 @@ struct vty_arg {
 #define IS_DIRECTORY_SEP(c) ((c) == DIRECTORY_SEP)
 #endif
 
-/* Exported variables */
-extern struct vty *vty_exclusive_lock;
-
 /* Prototypes. */
-extern void vty_init(struct thread_master *);
+extern void vty_init(struct thread_master *, bool do_command_logging);
 extern void vty_init_vtysh(void);
 extern void vty_terminate(void);
 extern void vty_reset(void);
@@ -305,10 +347,19 @@ extern struct vty *vty_stdio(void (*atclose)(int isexit));
  * - vty_endframe() clears the buffer without printing it, and prints an
  *   extra string if the buffer was empty before (for context-end markers)
  */
-extern int vty_out(struct vty *, const char *, ...) PRINTF_ATTRIBUTE(2, 3);
-extern void vty_frame(struct vty *, const char *, ...) PRINTF_ATTRIBUTE(2, 3);
+extern int vty_out(struct vty *, const char *, ...) PRINTFRR(2, 3);
+extern void vty_frame(struct vty *, const char *, ...) PRINTFRR(2, 3);
 extern void vty_endframe(struct vty *, const char *);
-bool vty_set_include(struct vty *vty, const char *regexp);
+extern bool vty_set_include(struct vty *vty, const char *regexp);
+/* returns CMD_SUCCESS so you can do a one-line "return vty_json(...)"
+ * NULL check and json_object_free() is included.
+ */
+extern int vty_json(struct vty *vty, struct json_object *json);
+
+/* post fd to be passed to the vtysh client
+ * fd is owned by the VTY code after this and will be closed when done
+ */
+extern void vty_pass_fd(struct vty *vty, int fd);
 
 extern bool vty_read_config(struct nb_config *config, const char *config_file,
 			    char *config_default_dir);
@@ -316,13 +367,11 @@ extern void vty_time_print(struct vty *, int);
 extern void vty_serv_sock(const char *, unsigned short, const char *);
 extern void vty_close(struct vty *);
 extern char *vty_get_cwd(void);
-extern void vty_log(const char *level, const char *proto, const char *fmt,
-		    struct timestamp_control *, va_list);
+extern void vty_update_xpath(const char *oldpath, const char *newpath);
 extern int vty_config_enter(struct vty *vty, bool private_config,
 			    bool exclusive);
 extern void vty_config_exit(struct vty *);
-extern int vty_config_exclusive_lock(struct vty *vty);
-extern void vty_config_exclusive_unlock(struct vty *vty);
+extern int vty_config_node_exit(struct vty *);
 extern int vty_shell(struct vty *);
 extern int vty_shell_serv(struct vty *);
 extern void vty_hello(struct vty *);
@@ -331,10 +380,6 @@ extern void vty_hello(struct vty *);
 extern void vty_stdio_suspend(void);
 extern void vty_stdio_resume(void);
 extern void vty_stdio_close(void);
-
-/* Send a fixed-size message to all vty terminal monitors; this should be
-   an async-signal-safe function. */
-extern void vty_log_fixed(char *buf, size_t len);
 
 #ifdef __cplusplus
 }

@@ -46,12 +46,13 @@ static void ripng_zebra_ipv6_send(struct ripng *ripng, struct agg_node *rp,
 	struct listnode *listnode = NULL;
 	struct ripng_info *rinfo = NULL;
 	int count = 0;
+	const struct prefix *p = agg_node_get_prefix(rp);
 
 	memset(&api, 0, sizeof(api));
 	api.vrf_id = ripng->vrf->vrf_id;
 	api.type = ZEBRA_ROUTE_RIPNG;
 	api.safi = SAFI_UNICAST;
-	api.prefix = rp->p;
+	api.prefix = *p;
 
 	SET_FLAG(api.message, ZAPI_MESSAGE_NEXTHOP);
 	for (ALL_LIST_ELEMENTS_RO(list, listnode, rinfo)) {
@@ -85,18 +86,17 @@ static void ripng_zebra_ipv6_send(struct ripng *ripng, struct agg_node *rp,
 
 	if (IS_RIPNG_DEBUG_ZEBRA) {
 		if (ripng->ecmp)
-			zlog_debug("%s: %s/%d nexthops %d",
+			zlog_debug("%s: %pRN nexthops %d",
 				   (cmd == ZEBRA_ROUTE_ADD)
 					   ? "Install into zebra"
 					   : "Delete from zebra",
-				   inet6_ntoa(rp->p.u.prefix6), rp->p.prefixlen,
-				   count);
+				   rp, count);
 		else
-			zlog_debug(
-				"%s: %s/%d",
-				(cmd == ZEBRA_ROUTE_ADD) ? "Install into zebra"
-							 : "Delete from zebra",
-				inet6_ntoa(rp->p.u.prefix6), rp->p.prefixlen);
+			zlog_debug("%s: %pRN",
+				   (cmd == ZEBRA_ROUTE_ADD)
+					   ? "Install into zebra"
+					   : "Delete from zebra",
+				   rp);
 	}
 }
 
@@ -113,8 +113,7 @@ void ripng_zebra_ipv6_delete(struct ripng *ripng, struct agg_node *rp)
 }
 
 /* Zebra route add and delete treatment. */
-static int ripng_zebra_read_route(int command, struct zclient *zclient,
-				  zebra_size_t length, vrf_id_t vrf_id)
+static int ripng_zebra_read_route(ZAPI_CALLBACK_ARGS)
 {
 	struct ripng *ripng;
 	struct zapi_route api;
@@ -138,7 +137,7 @@ static int ripng_zebra_read_route(int command, struct zclient *zclient,
 	nexthop = api.nexthops[0].gate.ipv6;
 	ifindex = api.nexthops[0].ifindex;
 
-	if (command == ZEBRA_REDISTRIBUTE_ROUTE_ADD)
+	if (cmd == ZEBRA_REDISTRIBUTE_ROUTE_ADD)
 		ripng_redistribute_add(ripng, api.type,
 				       RIPNG_ROUTE_REDISTRIBUTE,
 				       (struct prefix_ipv6 *)&api.prefix,
@@ -153,8 +152,8 @@ static int ripng_zebra_read_route(int command, struct zclient *zclient,
 
 void ripng_redistribute_conf_update(struct ripng *ripng, int type)
 {
-	zclient_redistribute(ZEBRA_REDISTRIBUTE_ADD, zclient, AFI_IP6, type, 0,
-			     ripng->vrf->vrf_id);
+	zebra_redistribute_send(ZEBRA_REDISTRIBUTE_ADD, zclient, AFI_IP6,
+				type, 0, ripng->vrf->vrf_id);
 }
 
 void ripng_redistribute_conf_delete(struct ripng *ripng, int type)
@@ -235,23 +234,23 @@ static void ripng_zebra_connected(struct zclient *zclient)
 	zclient_send_reg_requests(zclient, VRF_DEFAULT);
 }
 
+static zclient_handler *const ripng_handlers[] = {
+	[ZEBRA_INTERFACE_ADDRESS_ADD] = ripng_interface_address_add,
+	[ZEBRA_INTERFACE_ADDRESS_DELETE] = ripng_interface_address_delete,
+	[ZEBRA_INTERFACE_VRF_UPDATE] = ripng_interface_vrf_update,
+	[ZEBRA_REDISTRIBUTE_ROUTE_ADD] = ripng_zebra_read_route,
+	[ZEBRA_REDISTRIBUTE_ROUTE_DEL] = ripng_zebra_read_route,
+};
+
 /* Initialize zebra structure and it's commands. */
 void zebra_init(struct thread_master *master)
 {
 	/* Allocate zebra structure. */
-	zclient = zclient_new(master, &zclient_options_default);
+	zclient = zclient_new(master, &zclient_options_default, ripng_handlers,
+			      array_size(ripng_handlers));
 	zclient_init(zclient, ZEBRA_ROUTE_RIPNG, 0, &ripngd_privs);
 
 	zclient->zebra_connected = ripng_zebra_connected;
-	zclient->interface_up = ripng_interface_up;
-	zclient->interface_down = ripng_interface_down;
-	zclient->interface_add = ripng_interface_add;
-	zclient->interface_delete = ripng_interface_delete;
-	zclient->interface_address_add = ripng_interface_address_add;
-	zclient->interface_address_delete = ripng_interface_address_delete;
-	zclient->interface_vrf_update = ripng_interface_vrf_update;
-	zclient->redistribute_route_add = ripng_zebra_read_route;
-	zclient->redistribute_route_del = ripng_zebra_read_route;
 }
 
 void ripng_zebra_stop(void)

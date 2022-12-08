@@ -138,9 +138,6 @@ extern unsigned long term_debug_eigrp_zebra;
 
 /* Prototypes. */
 extern const char *eigrp_if_name_string(struct eigrp_interface *);
-extern const char *eigrp_if_ip_string(struct eigrp_interface *);
-extern const char *eigrp_neigh_ip_string(struct eigrp_neighbor *);
-extern const char *eigrp_topology_ip_string(struct eigrp_prefix_entry *);
 
 extern void eigrp_ip_header_dump(struct ip *);
 extern void eigrp_header_dump(struct eigrp_header *);
@@ -154,11 +151,11 @@ extern void show_ip_eigrp_interface_sub(struct vty *, struct eigrp *,
 					struct eigrp_interface *);
 extern void show_ip_eigrp_neighbor_sub(struct vty *, struct eigrp_neighbor *,
 				       int);
-extern void show_ip_eigrp_prefix_entry(struct vty *,
-				       struct eigrp_prefix_entry *);
-extern void show_ip_eigrp_nexthop_entry(struct vty *vty, struct eigrp *eigrp,
-					struct eigrp_nexthop_entry *ne,
-					bool *first);
+extern void show_ip_eigrp_prefix_descriptor(struct vty *vty,
+					    struct eigrp_prefix_descriptor *tn);
+extern void show_ip_eigrp_route_descriptor(struct vty *vty, struct eigrp *eigrp,
+					   struct eigrp_route_descriptor *ne,
+					   bool *first);
 
 extern void eigrp_debug_init(void);
 

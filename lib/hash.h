@@ -28,9 +28,6 @@
 extern "C" {
 #endif
 
-DECLARE_MTYPE(HASH)
-DECLARE_MTYPE(HASH_BACKET)
-
 /* Default hash table size.  */
 #define HASH_INITIAL_SIZE 256
 /* Expansion threshold */
@@ -38,11 +35,6 @@ DECLARE_MTYPE(HASH_BACKET)
 
 #define HASHWALK_CONTINUE 0
 #define HASHWALK_ABORT -1
-
-#if CONFDATE > 20200225
-CPP_NOTICE("hash.h: time to remove hash_backet #define")
-#endif
-#define hash_backet hash_bucket
 
 struct hash_bucket {
 	/*
@@ -79,12 +71,12 @@ struct hash {
 	unsigned int max_size;
 
 	/* Key make function. */
-	unsigned int (*hash_key)(void *);
+	unsigned int (*hash_key)(const void *);
 
 	/* Data compare function. */
 	bool (*hash_cmp)(const void *, const void *);
 
-	/* Backet alloc. */
+	/* Bucket alloc. */
 	unsigned long count;
 
 	struct hashstats stats;
@@ -111,7 +103,7 @@ struct hash {
  *
  * hash_cmp
  *    comparison function used for resolving collisions; when called with two
- *    data items, should return nonzero if the two items are equal and 0
+ *    data items, should return true if the two items are equal and false
  *    otherwise
  *
  * name
@@ -123,7 +115,7 @@ struct hash {
  * Returns:
  *    a new hash table
  */
-extern struct hash *hash_create(unsigned int (*hash_key)(void *),
+extern struct hash *hash_create(unsigned int (*hash_key)(const void *),
 				bool (*hash_cmp)(const void *, const void *),
 				const char *name);
 
@@ -145,7 +137,7 @@ extern struct hash *hash_create(unsigned int (*hash_key)(void *),
  *
  * hash_cmp
  *    comparison function used for resolving collisions; when called with two
- *    data items, should return nonzero if the two items are equal and 0
+ *    data items, should return true if the two items are equal and false
  *    otherwise
  *
  * name
@@ -158,7 +150,7 @@ extern struct hash *hash_create(unsigned int (*hash_key)(void *),
  *    a new hash table
  */
 extern struct hash *
-hash_create_size(unsigned int size, unsigned int (*hash_key)(void *),
+hash_create_size(unsigned int size, unsigned int (*hash_key)(const void *),
 		 bool (*hash_cmp)(const void *, const void *),
 		 const char *name);
 
@@ -169,7 +161,7 @@ hash_create_size(unsigned int size, unsigned int (*hash_key)(void *),
  * an element from its key, you must provide the data item itself, with the
  * portions used in the hash function set to the same values as the data item
  * to retrieve. To insert a data element, either provide the key as just
- * described and provide alloc_func as descrbied below to allocate the full
+ * described and provide alloc_func as described below to allocate the full
  * data element, or provide the full data element and pass 'hash_alloc_intern'
  * to alloc_func.
  *
@@ -243,8 +235,10 @@ extern void *hash_release(struct hash *hash, void *data);
 /*
  * Iterate over the elements in a hash table.
  *
- * It is safe to delete items passed to the iteration function from the hash
- * table during iteration.  Please note that adding entries to the hash
+ * The passed in arg to the handler function is the only safe
+ * item to delete from the hash.
+ *
+ * Please note that adding entries to the hash
  * during the walk will cause undefined behavior in that some new entries
  * will be walked and some will not.  So do not do this.
  *
@@ -265,8 +259,10 @@ extern void hash_iterate(struct hash *hash,
 /*
  * Iterate over the elements in a hash table, stopping on condition.
  *
- * It is safe to delete items passed to the iteration function from the hash
- * table during iteration.  Please note that adding entries to the hash
+ * The passed in arg to the handler function is the only safe item
+ * to delete from the hash.
+ *
+ * Please note that adding entries to the hash
  * during the walk will cause undefined behavior in that some new entries
  * will be walked and some will not.  So do not do this.
  *

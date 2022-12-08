@@ -27,12 +27,6 @@
 
 #include "compiler.h"
 
-#ifdef SUNOS_5
-typedef unsigned int uint32_t;
-typedef unsigned short uint16_t;
-typedef unsigned char uint8_t;
-#endif /* SUNOS_5 */
-
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,8 +48,9 @@ typedef unsigned char uint8_t;
 #ifdef HAVE_SYS_SYSCTL_H
 #ifdef GNU_LINUX
 #include <linux/types.h>
-#endif
+#else
 #include <sys/sysctl.h>
+#endif
 #endif /* HAVE_SYS_SYSCTL_H */
 #include <sys/ioctl.h>
 #ifdef HAVE_SYS_CONF_H
@@ -73,11 +68,12 @@ typedef unsigned char uint8_t;
 #include <limits.h>
 #include <inttypes.h>
 #include <stdbool.h>
-
-/* machine dependent includes */
-#ifdef SUNOS_5
-#include <strings.h>
-#endif /* SUNOS_5 */
+#ifdef HAVE_SYS_ENDIAN_H
+#include <sys/endian.h>
+#endif
+#ifdef HAVE_ENDIAN_H
+#include <endian.h>
+#endif
 
 /* machine dependent includes */
 #ifdef HAVE_LINUX_VERSION_H
@@ -90,30 +86,11 @@ typedef unsigned char uint8_t;
 
 /* misc include group */
 #include <stdarg.h>
-#if !(defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L)
-/* Not C99; do we need to define va_copy? */
-#ifndef va_copy
-#ifdef __va_copy
-#define va_copy(DST,SRC) __va_copy(DST,SRC)
-#else
-/* Now we are desperate; this should work on many typical platforms.
-   But this is slightly dangerous, because the standard does not require
-   va_copy to be a macro. */
-#define va_copy(DST,SRC) memcpy(&(DST), &(SRC), sizeof(va_list))
-#warning "Not C99 and no va_copy macro available, falling back to memcpy"
-#endif /* __va_copy */
-#endif /* !va_copy */
-#endif /* !C99 */
-
 
 #ifdef HAVE_LCAPS
 #include <sys/capability.h>
 #include <sys/prctl.h>
 #endif /* HAVE_LCAPS */
-
-#ifdef HAVE_SOLARIS_CAPABILITIES
-#include <priv.h>
-#endif /* HAVE_SOLARIS_CAPABILITIES */
 
 /* network include group */
 
@@ -132,6 +109,11 @@ typedef unsigned char uint8_t;
 #include <openssl/des.h>
 #      define crypt DES_crypt
 #endif
+#endif
+
+#ifdef CRYPTO_OPENSSL
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 #endif
 
 #include "openbsd-tree.h"
@@ -202,17 +184,11 @@ typedef unsigned char uint8_t;
 /* Some systems do not define UINT32_MAX, etc.. from inttypes.h
  * e.g. this makes life easier for FBSD 4.11 users.
  */
-#ifndef INT8_MAX
-#define INT8_MAX	(127)
-#endif
 #ifndef INT16_MAX
 #define INT16_MAX	(32767)
 #endif
 #ifndef INT32_MAX
 #define INT32_MAX	(2147483647)
-#endif
-#ifndef UINT8_MAX
-#define UINT8_MAX	(255U)
 #endif
 #ifndef UINT16_MAX
 #define UINT16_MAX	(65535U)
@@ -226,11 +202,11 @@ typedef unsigned char uint8_t;
 #endif /* HAVE_GLIBC_BACKTRACE */
 
 /* Local includes: */
-#if !(defined(__GNUC__) || defined(VTYSH_EXTRACT_PL))
+#if !defined(__GNUC__)
 #define __attribute__(x)
-#endif /* !__GNUC__ || VTYSH_EXTRACT_PL */
+#endif /* !__GNUC__ */
 
-#include "zassert.h"
+#include <assert.h>
 
 /*
  * Add explicit static cast only when using a C++ compiler.
@@ -239,6 +215,10 @@ typedef unsigned char uint8_t;
 #define static_cast(l, r) static_cast<decltype(l)>((r))
 #else
 #define static_cast(l, r) (r)
+#endif
+
+#ifdef __cplusplus
+extern "C" {
 #endif
 
 #ifndef HAVE_STRLCAT
@@ -250,12 +230,29 @@ size_t strlcpy(char *__restrict dest,
 	       const char *__restrict src, size_t destsize);
 #endif
 
-/* GCC have printf type attribute check.  */
-#ifdef __GNUC__
-#define PRINTF_ATTRIBUTE(a,b) __attribute__ ((__format__ (__printf__, a, b)))
-#else
-#define PRINTF_ATTRIBUTE(a,b)
-#endif /* __GNUC__ */
+#ifndef HAVE_EXPLICIT_BZERO
+void explicit_bzero(void *buf, size_t len);
+#endif
+
+#if !defined(HAVE_STRUCT_MMSGHDR_MSG_HDR) || !defined(HAVE_SENDMMSG)
+/* avoid conflicts in case we have partial support */
+#define mmsghdr frr_mmsghdr
+#define sendmmsg frr_sendmmsg
+
+struct mmsghdr {
+	struct msghdr msg_hdr;
+	unsigned int msg_len;
+};
+
+/* just go 1 at a time here, the loop this is used in will handle the rest */
+static inline int sendmmsg(int fd, struct mmsghdr *mmh, unsigned int len,
+			   int flags)
+{
+	int rv = sendmsg(fd, &mmh->msg_hdr, 0);
+
+	return rv > 0 ? 1 : rv;
+}
+#endif
 
 /*
  * RFC 3542 defines several macros for using struct cmsghdr.
@@ -313,27 +310,14 @@ struct in_pktinfo {
 #if defined(__NetBSD__)                                                        \
 	|| (defined(__FreeBSD__) && (__FreeBSD_version < 1100030))             \
 	|| (defined(__OpenBSD__) && (OpenBSD < 200311))                        \
-	|| (defined(__APPLE__))                                                \
-	|| (defined(SUNOS_5) && defined(WORDS_BIGENDIAN))
+	|| (defined(__APPLE__))
 #define HAVE_IP_HDRINCL_BSD_ORDER
 #endif
 
-/* Define BYTE_ORDER, if not defined. Useful for compiler conditional
- * code, rather than preprocessor conditional.
- * Not all the world has this BSD define.
- */
+/* autoconf macros for this are deprecated, just find endian.h */
 #ifndef BYTE_ORDER
-#define BIG_ENDIAN	4321	/* least-significant byte first (vax, pc) */
-#define LITTLE_ENDIAN	1234	/* most-significant byte first (IBM, net) */
-#define PDP_ENDIAN	3412	/* LSB first in word, MSW first in long (pdp) */
-
-#if defined(WORDS_BIGENDIAN)
-#define BYTE_ORDER	BIG_ENDIAN
-#else  /* !WORDS_BIGENDIAN */
-#define BYTE_ORDER	LITTLE_ENDIAN
-#endif /* WORDS_BIGENDIAN */
-
-#endif /* ndef BYTE_ORDER */
+#error please locate an endian.h file appropriate to your platform
+#endif
 
 /* For old definition. */
 #ifndef IN6_ARE_ADDR_EQUAL
@@ -343,12 +327,6 @@ struct in_pktinfo {
 /* default zebra TCP port for zclient */
 #define ZEBRA_PORT			2600
 
-/* Marker value used in new Zserv, in the byte location corresponding
- * the command value in the old zserv header. To allow old and new
- * Zserv headers to be distinguished from each other.
- */
-#define ZEBRA_HEADER_MARKER              254
-
 /*
  * The compiler.h header is used for anyone using the CPP_NOTICE
  * since this is universally needed, let's add it to zebra.h
@@ -356,76 +334,28 @@ struct in_pktinfo {
 #include "compiler.h"
 
 /* Zebra route's types are defined in route_types.h */
-#include "route_types.h"
-
-/* Note: whenever a new route-type or zserv-command is added the
- * corresponding {command,route}_types[] table in lib/log.c MUST be
- * updated! */
-
-/* Map a route type to a string.  For example, ZEBRA_ROUTE_RIPNG -> "ripng". */
-extern const char *zebra_route_string(unsigned int route_type);
-/* Map a route type to a char.  For example, ZEBRA_ROUTE_RIPNG -> 'R'. */
-extern char zebra_route_char(unsigned int route_type);
-/* Map a zserv command type to the same string,
- * e.g. ZEBRA_INTERFACE_ADD -> "ZEBRA_INTERFACE_ADD" */
-/* Map a protocol name to its number. e.g. ZEBRA_ROUTE_BGP->9*/
-extern int proto_name2num(const char *s);
-/* Map redistribute X argument to protocol number.
- * unlike proto_name2num, this accepts shorthands and takes
- * an AFI value to restrict input */
-extern int proto_redistnum(int afi, const char *s);
-
-extern const char *zserv_command_string(unsigned int command);
+#include "lib/route_types.h"
 
 #define strmatch(a,b) (!strcmp((a), (b)))
-
-/* Zebra message flags */
-
-/*
- * Cause Zebra to consider this routes nexthops recursively
- */
-#define ZEBRA_FLAG_ALLOW_RECURSION    0x01
-/*
- * This is a route that is read in on startup that was left around
- * from a previous run of FRR
- */
-#define ZEBRA_FLAG_SELFROUTE          0x02
-/*
- * This flag is used to tell Zebra that the BGP route being passed
- * down is a IBGP route
- */
-#define ZEBRA_FLAG_IBGP               0x04
-/*
- * This is a route that has been selected for FIB installation.
- * This flag is set in zebra and can be passed up to routing daemons
- */
-#define ZEBRA_FLAG_SELECTED           0x08
-/*
- * This is a route that we are telling Zebra that this route *must*
- * win and will be installed even over ZEBRA_FLAG_SELECTED
- */
-#define ZEBRA_FLAG_FIB_OVERRIDE       0x10
-/*
- * This flag tells Zebra that the route is a EVPN route and should
- * be treated specially
- */
-#define ZEBRA_FLAG_EVPN_ROUTE         0x20
-/*
- * This flag tells Zebra that it should treat the distance passed
- * down as an additional discriminator for route selection of the
- * route entry.  This mainly is used for backup static routes.
- */
-#define ZEBRA_FLAG_RR_USE_DISTANCE    0x40
 
 #ifndef INADDR_LOOPBACK
 #define	INADDR_LOOPBACK	0x7f000001	/* Internet address 127.0.0.1.  */
 #endif
 
 /* Address family numbers from RFC1700. */
-typedef enum { AFI_IP = 1, AFI_IP6 = 2, AFI_L2VPN = 3, AFI_MAX = 4 } afi_t;
+typedef enum {
+	AFI_UNSPEC = 0,
+	AFI_IP = 1,
+	AFI_IP6 = 2,
+	AFI_L2VPN = 3,
+	AFI_MAX = 4
+} afi_t;
+
+#define IS_VALID_AFI(a) ((a) > AFI_UNSPEC && (a) < AFI_MAX)
 
 /* Subsequent Address Family Identifier. */
 typedef enum {
+	SAFI_UNSPEC = 0,
 	SAFI_UNICAST = 1,
 	SAFI_MULTICAST = 2,
 	SAFI_MPLS_VPN = 3,
@@ -436,34 +366,13 @@ typedef enum {
 	SAFI_MAX = 8
 } safi_t;
 
-/*
- * The above AFI and SAFI definitions are for internal use. The protocol
- * definitions (IANA values) as for example used in BGP protocol packets
- * are defined below and these will get mapped to/from the internal values
- * in the appropriate places.
- * The rationale is that the protocol (IANA) values may be sparse and are
- * not optimal for use in data-structure sizing.
- * Note: Only useful (i.e., supported) values are defined below.
- */
-typedef enum {
-	IANA_AFI_RESERVED = 0,
-	IANA_AFI_IPV4 = 1,
-	IANA_AFI_IPV6 = 2,
-	IANA_AFI_L2VPN = 25,
-	IANA_AFI_IPMR = 128,
-	IANA_AFI_IP6MR = 129
-} iana_afi_t;
+#define FOREACH_AFI_SAFI(afi, safi)                                            \
+	for (afi = AFI_IP; afi < AFI_MAX; afi++)                               \
+		for (safi = SAFI_UNICAST; safi < SAFI_MAX; safi++)
 
-typedef enum {
-	IANA_SAFI_RESERVED = 0,
-	IANA_SAFI_UNICAST = 1,
-	IANA_SAFI_MULTICAST = 2,
-	IANA_SAFI_LABELED_UNICAST = 4,
-	IANA_SAFI_ENCAP = 7,
-	IANA_SAFI_EVPN = 70,
-	IANA_SAFI_MPLS_VPN = 128,
-	IANA_SAFI_FLOWSPEC = 133
-} iana_safi_t;
+#define FOREACH_AFI_SAFI_NSF(afi, safi)                                        \
+	for (afi = AFI_IP; afi < AFI_MAX; afi++)                               \
+		for (safi = SAFI_UNICAST; safi <= SAFI_MPLS_VPN; safi++)
 
 /* Default Administrative Distance of each protocol. */
 #define ZEBRA_KERNEL_DISTANCE_DEFAULT      0
@@ -495,10 +404,6 @@ typedef enum {
 #define RESET_FLAG_ATOMIC(PV)                                                  \
 	((atomic_store_explicit(PV, 0, memory_order_seq_cst)))
 
-/* Zebra types. Used in Zserv message header. */
-typedef uint16_t zebra_size_t;
-typedef uint16_t zebra_command_t;
-
 /* VRF ID type. */
 typedef uint32_t vrf_id_t;
 
@@ -506,76 +411,11 @@ typedef uint32_t route_tag_t;
 #define ROUTE_TAG_MAX UINT32_MAX
 #define ROUTE_TAG_PRI PRIu32
 
-static inline afi_t afi_iana2int(iana_afi_t afi)
-{
-	switch (afi) {
-	case IANA_AFI_IPV4:
-		return AFI_IP;
-	case IANA_AFI_IPV6:
-		return AFI_IP6;
-	case IANA_AFI_L2VPN:
-		return AFI_L2VPN;
-	default:
-		return AFI_MAX;
-	}
-}
+/* Name of hook calls */
+#define ZEBRA_ON_RIB_PROCESS_HOOK_CALL "on_rib_process_dplane_results"
 
-static inline iana_afi_t afi_int2iana(afi_t afi)
-{
-	switch (afi) {
-	case AFI_IP:
-		return IANA_AFI_IPV4;
-	case AFI_IP6:
-		return IANA_AFI_IPV6;
-	case AFI_L2VPN:
-		return IANA_AFI_L2VPN;
-	default:
-		return IANA_AFI_RESERVED;
-	}
+#ifdef __cplusplus
 }
-
-static inline safi_t safi_iana2int(iana_safi_t safi)
-{
-	switch (safi) {
-	case IANA_SAFI_UNICAST:
-		return SAFI_UNICAST;
-	case IANA_SAFI_MULTICAST:
-		return SAFI_MULTICAST;
-	case IANA_SAFI_MPLS_VPN:
-		return SAFI_MPLS_VPN;
-	case IANA_SAFI_ENCAP:
-		return SAFI_ENCAP;
-	case IANA_SAFI_EVPN:
-		return SAFI_EVPN;
-	case IANA_SAFI_LABELED_UNICAST:
-		return SAFI_LABELED_UNICAST;
-	case IANA_SAFI_FLOWSPEC:
-		return SAFI_FLOWSPEC;
-	default:
-		return SAFI_MAX;
-	}
-}
-
-static inline iana_safi_t safi_int2iana(safi_t safi)
-{
-	switch (safi) {
-	case SAFI_UNICAST:
-		return IANA_SAFI_UNICAST;
-	case SAFI_MULTICAST:
-		return IANA_SAFI_MULTICAST;
-	case SAFI_MPLS_VPN:
-		return IANA_SAFI_MPLS_VPN;
-	case SAFI_ENCAP:
-		return IANA_SAFI_ENCAP;
-	case SAFI_EVPN:
-		return IANA_SAFI_EVPN;
-	case SAFI_LABELED_UNICAST:
-		return IANA_SAFI_LABELED_UNICAST;
-	case SAFI_FLOWSPEC:
-		return IANA_SAFI_FLOWSPEC;
-	default:
-		return IANA_SAFI_RESERVED;
-	}
-}
+#endif
 
 #endif /* _ZEBRA_H */

@@ -80,6 +80,8 @@ static void extendbuf(char **what, const char *arg)
 }
 #define extend(x) extendbuf(&value, x)
 
+#ifndef __clang_analyzer__
+
 %}
 
 ID		[A-Za-z0-9_]+
@@ -140,6 +142,8 @@ SPECIAL		[(),]
 "DEFPY_NOSH"			value = strdup(yytext); return DEFUNNY;
 "DEFPY_ATTR"			value = strdup(yytext); return DEFUNNY;
 "DEFPY_HIDDEN"			value = strdup(yytext); return DEFUNNY;
+"DEFPY_YANG"			value = strdup(yytext); return DEFUNNY;
+"DEFPY_YANG_NOSH"		value = strdup(yytext); return DEFUNNY;
 "ALIAS"				value = strdup(yytext); return DEFUNNY;
 "ALIAS_HIDDEN"			value = strdup(yytext); return DEFUNNY;
 "install_element"		value = strdup(yytext); return INSTALL;
@@ -155,6 +159,8 @@ SPECIAL		[(),]
 
 %%
 
+#endif /* __clang_analyzer__ */
+
 static int yylex_clr(char **retbuf)
 {
 	int rv = def_yylex();
@@ -163,7 +169,7 @@ static int yylex_clr(char **retbuf)
 	return rv;
 }
 
-static PyObject *get_args(void)
+static PyObject *get_args(const char *filename, int lineno)
 {
 	PyObject *pyObj = PyList_New(0);
 	PyObject *pyArg = NULL;
@@ -189,6 +195,13 @@ static PyObject *get_args(void)
 		if (token == COMMENT) {
 			free(tval);
 			continue;
+		}
+		if (token == PREPROC) {
+			free(tval);
+			Py_DECREF(pyObj);
+			return PyErr_Format(PyExc_ValueError,
+					"%s:%d: cannot process CPP directive within argument list",
+					filename, lineno);
 		}
 		if (token == SPECIAL) {
 			if (depth == 1 && (tval[0] == ',' || tval[0] == ')')) {
@@ -244,7 +257,12 @@ PyObject *clippy_parse(PyObject *self, PyObject *args)
 		case DEFUNNY:
 		case INSTALL:
 		case AUXILIARY:
-			pyArgs = get_args();
+			pyArgs = get_args(filename, lineno);
+			if (!pyArgs) {
+				free(tval);
+				Py_DECREF(pyCont);
+				return NULL;
+			}
 			pyItem = PyDict_New();
 			PyDict_SetItemString(pyItem, "type", PyUnicode_FromString(tval));
 			PyDict_SetItemString(pyItem, "args", pyArgs);
@@ -260,6 +278,7 @@ PyObject *clippy_parse(PyObject *self, PyObject *args)
 			pyItem = PyDict_New();
 			PyDict_SetItemString(pyItem, "type", PyUnicode_FromString("PREPROC"));
 			PyDict_SetItemString(pyItem, "line", PyUnicode_FromString(tval));
+			lineno--;
 			break;
 		}
 		if (pyItem) {

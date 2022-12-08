@@ -26,6 +26,7 @@
 #include <lib/lib_errors.h>
 
 #include "pimd.h"
+#include "pim_instance.h"
 #include "pim_str.h"
 #include "pim_errors.h"
 
@@ -66,25 +67,33 @@ static char *pim_msdp_pkt_type_dump(enum pim_msdp_tlv type, char *buf,
 
 static void pim_msdp_pkt_sa_dump_one(struct stream *s)
 {
-	struct prefix_sg sg;
+	pim_sgaddr sg;
 
 	/* just throw away the three reserved bytes */
 	stream_get3(s);
 	/* throw away the prefix length also */
 	stream_getc(s);
 
-	memset(&sg, 0, sizeof(struct prefix_sg));
+	memset(&sg, 0, sizeof(sg));
 	sg.grp.s_addr = stream_get_ipv4(s);
 	sg.src.s_addr = stream_get_ipv4(s);
 
-	zlog_debug("  sg %s", pim_str_sg_dump(&sg));
+	zlog_debug("  sg %pSG", &sg);
 }
 
 static void pim_msdp_pkt_sa_dump(struct stream *s)
 {
+	const size_t header_length = PIM_MSDP_SA_X_SIZE - PIM_MSDP_HEADER_SIZE;
+	size_t payload_length;
 	int entry_cnt;
 	int i;
 	struct in_addr rp; /* Last RP address associated with this SA */
+
+	if (header_length > STREAM_READABLE(s)) {
+		zlog_err("BUG MSDP SA bad header (readable %zu expected %zu)",
+			 STREAM_READABLE(s), header_length);
+		return;
+	}
 
 	entry_cnt = stream_getc(s);
 	rp.s_addr = stream_get_ipv4(s);
@@ -93,6 +102,13 @@ static void pim_msdp_pkt_sa_dump(struct stream *s)
 		char rp_str[INET_ADDRSTRLEN];
 		pim_inet4_dump("<rp?>", rp, rp_str, sizeof(rp_str));
 		zlog_debug("  entry_cnt %d rp %s", entry_cnt, rp_str);
+	}
+
+	payload_length = (size_t)entry_cnt * PIM_MSDP_SA_ONE_ENTRY_SIZE;
+	if (payload_length > STREAM_READABLE(s)) {
+		zlog_err("BUG MSDP SA bad length (readable %zu expected %zu)",
+			 STREAM_READABLE(s), payload_length);
+		return;
 	}
 
 	/* dump SAs */
@@ -112,6 +128,11 @@ static void pim_msdp_pkt_dump(struct pim_msdp_peer *mp, int type, int len,
 		   rx ? "rx" : "tx", type_str, len);
 
 	if (!s) {
+		return;
+	}
+
+	if (len < PIM_MSDP_HEADER_SIZE) {
+		zlog_err("invalid MSDP header length");
 		return;
 	}
 
@@ -182,7 +203,7 @@ static void pim_msdp_write_proceed_actions(struct pim_msdp_peer *mp)
 	}
 }
 
-int pim_msdp_write(struct thread *thread)
+void pim_msdp_write(struct thread *thread)
 {
 	struct pim_msdp_peer *mp;
 	struct stream *s;
@@ -199,22 +220,20 @@ int pim_msdp_write(struct thread *thread)
 		zlog_debug("MSDP peer %s pim_msdp_write", mp->key_str);
 	}
 	if (mp->fd < 0) {
-		return -1;
+		return;
 	}
 
 	/* check if TCP connection is established */
 	if (mp->state != PIM_MSDP_ESTABLISHED) {
 		pim_msdp_connect_check(mp);
-		return 0;
+		return;
 	}
 
 	s = stream_fifo_head(mp->obuf);
 	if (!s) {
 		pim_msdp_write_proceed_actions(mp);
-		return 0;
+		return;
 	}
-
-	sockopt_cork(mp->fd, 1);
 
 	/* Nonblocking write until TCP output buffer is full  */
 	do {
@@ -237,7 +256,7 @@ int pim_msdp_write(struct thread *thread)
 			}
 
 			pim_msdp_peer_reset_tcp_conn(mp, "pkt-tx-failed");
-			return 0;
+			return;
 		}
 
 		if (num != writenum) {
@@ -280,14 +299,10 @@ int pim_msdp_write(struct thread *thread)
 	} while ((s = stream_fifo_head(mp->obuf)) != NULL);
 	pim_msdp_write_proceed_actions(mp);
 
-	sockopt_cork(mp->fd, 0);
-
 	if (PIM_DEBUG_MSDP_INTERNAL) {
 		zlog_debug("MSDP peer %s pim_msdp_write wrote %d packets",
 			   mp->key_str, work_cnt);
 	}
-
-	return 0;
 }
 
 static void pim_msdp_pkt_send(struct pim_msdp_peer *mp, struct stream *s)
@@ -348,7 +363,8 @@ static void pim_msdp_pkt_sa_push(struct pim_instance *pim,
 	}
 }
 
-static int pim_msdp_pkt_sa_fill_hdr(struct pim_instance *pim, int local_cnt)
+static int pim_msdp_pkt_sa_fill_hdr(struct pim_instance *pim, int local_cnt,
+				    struct in_addr rp)
 {
 	int curr_tlv_ecnt;
 
@@ -361,7 +377,7 @@ static int pim_msdp_pkt_sa_fill_hdr(struct pim_instance *pim, int local_cnt)
 	stream_putw(pim->msdp.work_obuf,
 		    PIM_MSDP_SA_ENTRY_CNT2SIZE(curr_tlv_ecnt));
 	stream_putc(pim->msdp.work_obuf, curr_tlv_ecnt);
-	stream_put_ipv4(pim->msdp.work_obuf, pim->msdp.originator_id.s_addr);
+	stream_put_ipv4(pim->msdp.work_obuf, rp.s_addr);
 
 	return local_cnt;
 }
@@ -387,7 +403,8 @@ static void pim_msdp_pkt_sa_gen(struct pim_instance *pim,
 		zlog_debug("  sa gen  %d", local_cnt);
 	}
 
-	local_cnt = pim_msdp_pkt_sa_fill_hdr(pim, local_cnt);
+	local_cnt = pim_msdp_pkt_sa_fill_hdr(pim, local_cnt,
+					     pim->msdp.originator_id);
 
 	for (ALL_LIST_ELEMENTS_RO(pim->msdp.sa_list, sanode, sa)) {
 		if (!(sa->flags & PIM_MSDP_SAF_LOCAL)) {
@@ -408,7 +425,8 @@ static void pim_msdp_pkt_sa_gen(struct pim_instance *pim,
 				zlog_debug("  sa gen for remainder %d",
 					   local_cnt);
 			}
-			local_cnt = pim_msdp_pkt_sa_fill_hdr(pim, local_cnt);
+			local_cnt = pim_msdp_pkt_sa_fill_hdr(
+				pim, local_cnt, pim->msdp.originator_id);
 		}
 	}
 
@@ -441,7 +459,7 @@ void pim_msdp_pkt_sa_tx(struct pim_instance *pim)
 
 void pim_msdp_pkt_sa_tx_one(struct pim_msdp_sa *sa)
 {
-	pim_msdp_pkt_sa_fill_hdr(sa->pim, 1 /* cnt */);
+	pim_msdp_pkt_sa_fill_hdr(sa->pim, 1 /* cnt */, sa->rp);
 	pim_msdp_pkt_sa_fill_one(sa);
 	pim_msdp_pkt_sa_push(sa->pim, NULL);
 	pim_msdp_pkt_sa_tx_done(sa->pim);
@@ -452,6 +470,24 @@ void pim_msdp_pkt_sa_tx_to_one_peer(struct pim_msdp_peer *mp)
 {
 	pim_msdp_pkt_sa_gen(mp->pim, mp);
 	pim_msdp_pkt_sa_tx_done(mp->pim);
+}
+
+void pim_msdp_pkt_sa_tx_one_to_one_peer(struct pim_msdp_peer *mp,
+					struct in_addr rp, pim_sgaddr sg)
+{
+	struct pim_msdp_sa sa;
+
+	/* Fills the SA header. */
+	pim_msdp_pkt_sa_fill_hdr(mp->pim, 1, rp);
+
+	/* Fills the message contents. */
+	sa.pim = mp->pim;
+	sa.sg = sg;
+	pim_msdp_pkt_sa_fill_one(&sa);
+
+	/* Pushes the message. */
+	pim_msdp_pkt_sa_push(sa.pim, mp);
+	pim_msdp_pkt_sa_tx_done(sa.pim);
 }
 
 static void pim_msdp_pkt_rxed_with_fatal_error(struct pim_msdp_peer *mp)
@@ -472,17 +508,19 @@ static void pim_msdp_pkt_ka_rx(struct pim_msdp_peer *mp, int len)
 static void pim_msdp_pkt_sa_rx_one(struct pim_msdp_peer *mp, struct in_addr rp)
 {
 	int prefix_len;
-	struct prefix_sg sg;
+	pim_sgaddr sg;
+	struct listnode *peer_node;
+	struct pim_msdp_peer *peer;
 
 	/* just throw away the three reserved bytes */
 	stream_get3(mp->ibuf);
 	prefix_len = stream_getc(mp->ibuf);
 
-	memset(&sg, 0, sizeof(struct prefix_sg));
+	memset(&sg, 0, sizeof(sg));
 	sg.grp.s_addr = stream_get_ipv4(mp->ibuf);
 	sg.src.s_addr = stream_get_ipv4(mp->ibuf);
 
-	if (prefix_len != 32) {
+	if (prefix_len != IPV4_MAX_BITLEN) {
 		/* ignore SA update if the prefix length is not 32 */
 		flog_err(EC_PIM_MSDP_PACKET,
 			 "rxed sa update with invalid prefix length %d",
@@ -490,9 +528,25 @@ static void pim_msdp_pkt_sa_rx_one(struct pim_msdp_peer *mp, struct in_addr rp)
 		return;
 	}
 	if (PIM_DEBUG_MSDP_PACKETS) {
-		zlog_debug("  sg %s", pim_str_sg_dump(&sg));
+		zlog_debug("  sg %pSG", &sg);
 	}
 	pim_msdp_sa_ref(mp->pim, mp, &sg, rp);
+
+	/* Forwards the SA to the peers that are not in the RPF to the RP nor in
+	 * the same mesh group as the peer from which we received the message.
+	 * If the message group is not set, i.e. "default", then we assume that
+	 * the message must be forwarded.*/
+	for (ALL_LIST_ELEMENTS_RO(mp->pim->msdp.peer_list, peer_node, peer)) {
+		/* Not a RPF peer, so skip it. */
+		if (pim_msdp_peer_rpf_check(peer, rp))
+			continue;
+		/* Don't forward inside the meshed group. */
+		if ((mp->flags & PIM_MSDP_PEERF_IN_GROUP)
+		    && strcmp(mp->mesh_group_name, peer->mesh_group_name) == 0)
+			continue;
+
+		pim_msdp_pkt_sa_tx_one_to_one_peer(peer, rp, sg);
+	}
 }
 
 static void pim_msdp_pkt_sa_rx(struct pim_msdp_peer *mp, int len)
@@ -510,10 +564,9 @@ static void pim_msdp_pkt_sa_rx(struct pim_msdp_peer *mp, int len)
 
 	entry_cnt = stream_getc(mp->ibuf);
 	/* some vendors include the actual multicast data in the tlv (at the
-	 * end).
-	 * we will ignore such data. in the future we may consider pushing it
-	 * down
-	 * the RPT */
+	 * end). we will ignore such data. in the future we may consider pushing
+	 * it down the RPT
+	 */
 	if (len < PIM_MSDP_SA_ENTRY_CNT2SIZE(entry_cnt)) {
 		pim_msdp_pkt_rxed_with_fatal_error(mp);
 		return;
@@ -526,6 +579,8 @@ static void pim_msdp_pkt_sa_rx(struct pim_msdp_peer *mp, int len)
 		zlog_debug("  entry_cnt %d rp %s", entry_cnt, rp_str);
 	}
 
+	pim_msdp_peer_pkt_rxed(mp);
+
 	if (!pim_msdp_peer_rpf_check(mp, rp)) {
 		/* if peer-RPF check fails don't process the packet any further
 		 */
@@ -534,8 +589,6 @@ static void pim_msdp_pkt_sa_rx(struct pim_msdp_peer *mp, int len)
 		}
 		return;
 	}
-
-	pim_msdp_peer_pkt_rxed(mp);
 
 	/* update SA cache */
 	for (i = 0; i < entry_cnt; ++i) {
@@ -636,7 +689,7 @@ static int pim_msdp_read_packet(struct pim_msdp_peer *mp)
 	return 0;
 }
 
-int pim_msdp_read(struct thread *thread)
+void pim_msdp_read(struct thread *thread)
 {
 	struct pim_msdp_peer *mp;
 	int rc;
@@ -650,13 +703,13 @@ int pim_msdp_read(struct thread *thread)
 	}
 
 	if (mp->fd < 0) {
-		return -1;
+		return;
 	}
 
 	/* check if TCP connection is established */
 	if (mp->state != PIM_MSDP_ESTABLISHED) {
 		pim_msdp_connect_check(mp);
-		return 0;
+		return;
 	}
 
 	PIM_MSDP_PEER_READ_ON(mp);
@@ -668,32 +721,51 @@ int pim_msdp_read(struct thread *thread)
 	if (stream_get_endp(mp->ibuf) < PIM_MSDP_HEADER_SIZE) {
 		/* start by reading the TLV header */
 		rc = pim_msdp_read_packet(mp);
-		if (rc < 0) {
-			goto pim_msdp_read_end;
-		}
+		if (rc < 0)
+			return;
 
 		/* Find TLV type and len  */
 		stream_getc(mp->ibuf);
 		len = stream_getw(mp->ibuf);
 		if (len < PIM_MSDP_HEADER_SIZE) {
 			pim_msdp_pkt_rxed_with_fatal_error(mp);
-			goto pim_msdp_read_end;
+			return;
 		}
+
+		/*
+		 * Handle messages with longer than expected TLV size: resize
+		 * the stream to handle reading the whole message.
+		 *
+		 * RFC 3618 Section 12. 'Packet Formats':
+		 * > ... If an implementation receives a TLV whose length
+		 * > exceeds the maximum TLV length specified below, the TLV
+		 * > SHOULD be accepted. Any additional data, including possible
+		 * > next TLV's in the same message, SHOULD be ignored, and the
+		 * > MSDP session should not be reset. ...
+		 */
+		if (len > PIM_MSDP_SA_TLV_MAX_SIZE) {
+			/* Check if the current buffer is big enough. */
+			if (mp->ibuf->size < len) {
+				if (PIM_DEBUG_MSDP_PACKETS)
+					zlog_debug(
+						"MSDP peer %s sent TLV with unexpected large length (%d bytes)",
+						mp->key_str, len);
+
+				stream_resize_inplace(&mp->ibuf, len);
+			}
+		}
+
 		/* read complete TLV */
 		mp->packet_size = len;
 	}
 
 	rc = pim_msdp_read_packet(mp);
-	if (rc < 0) {
-		goto pim_msdp_read_end;
-	}
+	if (rc < 0)
+		return;
 
 	pim_msdp_pkt_rx(mp);
 
 	/* reset input buffers and get ready for the next packet */
 	mp->packet_size = 0;
 	stream_reset(mp->ibuf);
-
-pim_msdp_read_end:
-	return 0;
 }

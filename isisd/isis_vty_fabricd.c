@@ -23,8 +23,9 @@
 
 #include "command.h"
 
+#include "lib/bfd.h"
+#include "isisd/isis_bfd.h"
 #include "isisd/isisd.h"
-#include "isisd/isis_vty_common.h"
 #include "isisd/fabricd.h"
 #include "isisd/isis_tlvs.h"
 #include "isisd/isis_misc.h"
@@ -33,6 +34,25 @@
 #include "isisd/isis_circuit.h"
 #include "lib/spf_backoff.h"
 #include "isisd/isis_mt.h"
+
+static struct isis_circuit *isis_circuit_lookup(struct vty *vty)
+{
+	struct interface *ifp = VTY_GET_CONTEXT(interface);
+	struct isis_circuit *circuit;
+
+	if (!ifp) {
+		vty_out(vty, "Invalid interface \n");
+		return NULL;
+	}
+
+	circuit = circuit_scan_by_ifp(ifp);
+	if (!circuit) {
+		vty_out(vty, "ISIS is not enabled on circuit %s\n", ifp->name);
+		return NULL;
+	}
+
+	return circuit;
+}
 
 DEFUN (fabric_tier,
        fabric_tier_cmd,
@@ -92,11 +112,13 @@ DEFUN (no_triggered_csnp,
 	return CMD_SUCCESS;
 }
 
-static void lsp_print_flooding(struct vty *vty, struct isis_lsp *lsp)
+static void lsp_print_flooding(struct vty *vty, struct isis_lsp *lsp,
+			       struct isis *isis)
 {
 	char lspid[255];
+	char buf[MONOTIME_STRLEN];
 
-	lspid_print(lsp->hdr.lsp_id, lspid, true, true);
+	lspid_print(lsp->hdr.lsp_id, lspid, sizeof(lspid), true, true, isis);
 	vty_out(vty, "Flooding information for %s\n", lspid);
 
 	if (!lsp->flooding_neighbors[TX_LSP_NORMAL]) {
@@ -109,23 +131,13 @@ static void lsp_print_flooding(struct vty *vty, struct isis_lsp *lsp)
 		lsp->flooding_interface : "(null)");
 
 	time_t uptime = time(NULL) - lsp->flooding_time;
-	struct tm *tm = gmtime(&uptime);
 
-	if (uptime < ONE_DAY_SECOND)
-		vty_out(vty, "%02d:%02d:%02d", tm->tm_hour, tm->tm_min,
-			tm->tm_sec);
-	else if (uptime < ONE_WEEK_SECOND)
-		vty_out(vty, "%dd%02dh%02dm", tm->tm_yday, tm->tm_hour,
-			tm->tm_min);
-	else
-		vty_out(vty, "%02dw%dd%02dh", tm->tm_yday / 7,
-			tm->tm_yday - ((tm->tm_yday / 7) * 7),
-			tm->tm_hour);
-	vty_out(vty, " ago)\n");
+	frrtime_to_interval(uptime, buf, sizeof(buf));
+
+	vty_out(vty, "%s ago)\n", buf);
 
 	if (lsp->flooding_circuit_scoped) {
-		vty_out(vty, "    Received as circuit-scoped LSP, so not "
-			"flooded.\n");
+		vty_out(vty, "    Received as circuit-scoped LSP, so not flooded.\n");
 		return;
 	}
 
@@ -159,25 +171,29 @@ DEFUN (show_lsp_flooding,
 
 	struct listnode *node;
 	struct isis_area *area;
+	struct isis *isis = NULL;
+
+	isis = isis_lookup_by_vrfid(VRF_DEFAULT);
+
+	if (isis == NULL) {
+		vty_out(vty, "IS-IS Routing Process not enabled\n");
+		return CMD_SUCCESS;
+	}
 
 	for (ALL_LIST_ELEMENTS_RO(isis->area_list, node, area)) {
 		struct lspdb_head *head = &area->lspdb[ISIS_LEVEL2 - 1];
 		struct isis_lsp *lsp;
 
-		vty_out(vty, "Area %s:\n", area->area_tag ?
-			area->area_tag : "null");
-
+		vty_out(vty, "Area %s:\n",
+			area->area_tag ? area->area_tag : "null");
 		if (lspid) {
-			struct isis_lsp *lsp = lsp_for_arg(head, lspid);
-
+			lsp = lsp_for_sysid(head, lspid, isis);
 			if (lsp)
-				lsp_print_flooding(vty, lsp);
-
+				lsp_print_flooding(vty, lsp, isis);
 			continue;
 		}
-
-		for_each (lspdb, head, lsp) {
-			lsp_print_flooding(vty, lsp);
+		frr_each (lspdb, head, lsp) {
+			lsp_print_flooding(vty, lsp, isis);
 			vty_out(vty, "\n");
 		}
 	}
@@ -211,12 +227,12 @@ DEFUN (ip_router_isis,
 		}
 	}
 
-	area = isis_area_lookup(area_tag);
+	area = isis_area_lookup(area_tag, VRF_DEFAULT);
 	if (!area)
-		area = isis_area_create(area_tag);
+		isis_area_create(area_tag, VRF_DEFAULT_NAME);
 
-	if (!circuit || !circuit->area) {
-		circuit = isis_circuit_create(area, ifp);
+	if (!circuit) {
+		circuit = isis_circuit_new(ifp, area_tag);
 
 		if (circuit->state != C_STATE_CONF
 		    && circuit->state != C_STATE_UP) {
@@ -265,14 +281,14 @@ DEFUN (no_ip_router_isis,
 	const char *af = argv[idx_afi]->arg;
 	const char *area_tag = argv[idx_word]->arg;
 
-	area = isis_area_lookup(area_tag);
+	area = isis_area_lookup(area_tag, VRF_DEFAULT);
 	if (!area) {
 		vty_out(vty, "Can't find ISIS instance %s\n",
 			area_tag);
 		return CMD_ERR_NO_MATCH;
 	}
 
-	circuit = circuit_lookup_by_ifp(ifp, area->circuit_list);
+	circuit = circuit_scan_by_ifp(ifp);
 	if (!circuit) {
 		vty_out(vty, "ISIS is not enabled on circuit %s\n", ifp->name);
 		return CMD_ERR_NO_MATCH;
@@ -285,6 +301,52 @@ DEFUN (no_ip_router_isis,
 		ip = false;
 
 	isis_circuit_af_set(circuit, ip, ipv6);
+
+	if (!ip && !ipv6)
+		isis_circuit_del(circuit);
+
+	return CMD_SUCCESS;
+}
+
+DEFUN (isis_bfd,
+       isis_bfd_cmd,
+       PROTO_NAME " bfd",
+       PROTO_HELP
+       "Enable BFD support\n")
+{
+	struct isis_circuit *circuit = isis_circuit_lookup(vty);
+
+	if (!circuit)
+		return CMD_ERR_NO_MATCH;
+
+	if (circuit->bfd_config.enabled)
+		return CMD_SUCCESS;
+
+	circuit->bfd_config.enabled = true;
+	isis_bfd_circuit_cmd(circuit);
+
+	return CMD_SUCCESS;
+}
+
+DEFUN (no_isis_bfd,
+       no_isis_bfd_cmd,
+       "no " PROTO_NAME " bfd",
+       NO_STR
+       PROTO_HELP
+       "Disables BFD support\n"
+)
+{
+	struct isis_circuit *circuit = isis_circuit_lookup(vty);
+
+	if (!circuit)
+		return CMD_ERR_NO_MATCH;
+
+	if (!circuit->bfd_config.enabled)
+		return CMD_SUCCESS;
+
+	circuit->bfd_config.enabled = false;
+	isis_bfd_circuit_cmd(circuit);
+
 	return CMD_SUCCESS;
 }
 
@@ -382,8 +444,7 @@ isis_vty_lsp_gen_interval_set(struct vty *vty, int level, uint16_t interval)
 
 		if (interval >= area->lsp_refresh[lvl - 1]) {
 			vty_out(vty,
-				"LSP gen interval %us must be less than "
-				"the LSP refresh interval %us\n",
+				"LSP gen interval %us must be less than the LSP refresh interval %us\n",
 				interval, area->lsp_refresh[lvl - 1]);
 			return CMD_WARNING_CONFIG_FAILED;
 		}
@@ -433,15 +494,13 @@ isis_vty_lsp_refresh_set(struct vty *vty, int level, uint16_t interval)
 			continue;
 		if (interval <= area->lsp_gen_interval[lvl - 1]) {
 			vty_out(vty,
-				"LSP refresh interval %us must be greater than "
-				"the configured LSP gen interval %us\n",
+				"LSP refresh interval %us must be greater than the configured LSP gen interval %us\n",
 				interval, area->lsp_gen_interval[lvl - 1]);
 			return CMD_WARNING_CONFIG_FAILED;
 		}
 		if (interval > (area->max_lsp_lifetime[lvl - 1] - 300)) {
 			vty_out(vty,
-				"LSP refresh interval %us must be less than "
-				"the configured LSP lifetime %us less 300\n",
+				"LSP refresh interval %us must be less than the configured LSP lifetime %us less 300\n",
 				interval, area->max_lsp_lifetime[lvl - 1]);
 			return CMD_WARNING_CONFIG_FAILED;
 		}
@@ -491,20 +550,17 @@ isis_vty_max_lsp_lifetime_set(struct vty *vty, int level, uint16_t interval)
 
 		if (refresh_interval < area->lsp_refresh[lvl - 1]) {
 			vty_out(vty,
-				"Level %d Max LSP lifetime %us must be 300s greater than "
-				"the configured LSP refresh interval %us\n",
+				"Level %d Max LSP lifetime %us must be 300s greater than the configured LSP refresh interval %us\n",
 				lvl, interval, area->lsp_refresh[lvl - 1]);
 			vty_out(vty,
-				"Automatically reducing level %d LSP refresh interval "
-				"to %us\n",
+				"Automatically reducing level %d LSP refresh interval to %us\n",
 				lvl, refresh_interval);
 			set_refresh_interval[lvl - 1] = 1;
 
 			if (refresh_interval
 			    <= area->lsp_gen_interval[lvl - 1]) {
 				vty_out(vty,
-					"LSP refresh interval %us must be greater than "
-					"the configured LSP gen interval %us\n",
+					"LSP refresh interval %us must be greater than the configured LSP gen interval %us\n",
 					refresh_interval,
 					area->lsp_gen_interval[lvl - 1]);
 				return CMD_WARNING_CONFIG_FAILED;
@@ -790,8 +846,7 @@ DEFUN (isis_metric,
 	if (circuit->area && circuit->area->oldmetric == 1
 	    && met > MAX_NARROW_LINK_METRIC) {
 		vty_out(vty,
-			"Invalid metric %d - should be <0-63> "
-			"when narrow metric type enabled\n",
+			"Invalid metric %d - should be <0-63> when narrow metric type enabled\n",
 			met);
 		return CMD_WARNING_CONFIG_FAILED;
 	}
@@ -800,8 +855,7 @@ DEFUN (isis_metric,
 	if (circuit->area && circuit->area->newmetric == 1
 	    && met > MAX_WIDE_LINK_METRIC) {
 		vty_out(vty,
-			"Invalid metric %d - should be <0-16777215> "
-			"when wide metric type enabled\n",
+			"Invalid metric %d - should be <0-16777215> when wide metric type enabled\n",
 			met);
 		return CMD_WARNING_CONFIG_FAILED;
 	}
@@ -1045,6 +1099,8 @@ void isis_vty_daemon_init(void)
 	install_element(INTERFACE_NODE, &ip_router_isis_cmd);
 	install_element(INTERFACE_NODE, &ip6_router_isis_cmd);
 	install_element(INTERFACE_NODE, &no_ip_router_isis_cmd);
+	install_element(INTERFACE_NODE, &isis_bfd_cmd);
+	install_element(INTERFACE_NODE, &no_isis_bfd_cmd);
 
 	install_element(ROUTER_NODE, &set_overload_bit_cmd);
 	install_element(ROUTER_NODE, &no_set_overload_bit_cmd);

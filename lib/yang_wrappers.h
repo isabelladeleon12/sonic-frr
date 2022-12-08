@@ -22,6 +22,10 @@
 
 #include "prefix.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* bool */
 extern bool yang_str2bool(const char *value);
 extern struct yang_data *yang_data_new_bool(const char *xpath, bool value);
@@ -114,6 +118,28 @@ extern const char *yang_get_default_string(const char *xpath_fmt, ...);
 extern void yang_get_default_string_buf(char *buf, size_t size,
 					const char *xpath_fmt, ...);
 
+/* binary */
+extern struct yang_data *yang_data_new_binary(const char *xpath,
+					      const char *value, size_t len);
+extern size_t yang_dnode_get_binary_buf(char *buf, size_t size,
+					const struct lyd_node *dnode,
+					const char *xpath_fmt, ...);
+
+/* empty */
+extern struct yang_data *yang_data_new_empty(const char *xpath);
+extern bool yang_dnode_get_empty(const struct lyd_node *dnode,
+				 const char *xpath_fmt, ...);
+
+/* ip prefix */
+extern void yang_str2prefix(const char *value, union prefixptr prefix);
+extern struct yang_data *yang_data_new_prefix(const char *xpath,
+					      union prefixconstptr prefix);
+extern void yang_dnode_get_prefix(struct prefix *prefix,
+				  const struct lyd_node *dnode,
+				  const char *xpath_fmt, ...);
+extern void yang_get_default_prefix(union prefixptr var, const char *xpath_fmt,
+				    ...);
+
 /* ipv4 */
 extern void yang_str2ipv4(const char *value, struct in_addr *addr);
 extern struct yang_data *yang_data_new_ipv4(const char *xpath,
@@ -153,5 +179,32 @@ extern void yang_dnode_get_ipv6p(union prefixptr prefix,
 				 const char *xpath_fmt, ...);
 extern void yang_get_default_ipv6p(union prefixptr var, const char *xpath_fmt,
 				   ...);
+
+/* ip */
+extern void yang_str2ip(const char *value, struct ipaddr *addr);
+extern struct yang_data *yang_data_new_ip(const char *xpath,
+					  const struct ipaddr *addr);
+extern void yang_dnode_get_ip(struct ipaddr *addr, const struct lyd_node *dnode,
+			      const char *xpath_fmt, ...);
+extern void yang_get_default_ip(struct ipaddr *var, const char *xpath_fmt, ...);
+
+/* mac */
+extern struct yang_data *yang_data_new_mac(const char *xpath,
+					   const struct ethaddr *mac);
+extern void yang_str2mac(const char *value, struct ethaddr *mac);
+
+/*data-and-time */
+extern struct yang_data *yang_data_new_date_and_time(const char *xpath,
+						     time_t time);
+
+/* nexthop enum2str */
+extern const char *yang_nexthop_type2str(uint32_t ntype);
+
+const char *yang_afi_safi_value2identity(afi_t afi, safi_t safi);
+void yang_afi_safi_identity2value(const char *key, afi_t *afi, safi_t *safi);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _FRR_NORTHBOUND_WRAPPERS_H_ */

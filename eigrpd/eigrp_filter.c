@@ -57,7 +57,6 @@
 #include "eigrpd/eigrp_const.h"
 #include "eigrpd/eigrp_filter.h"
 #include "eigrpd/eigrp_packet.h"
-#include "eigrpd/eigrp_memory.h"
 
 /*
  * Distribute-list update functions.
@@ -65,17 +64,15 @@
 void eigrp_distribute_update(struct distribute_ctx *ctx,
 			     struct distribute *dist)
 {
+	struct eigrp *e = eigrp_lookup(ctx->vrf->vrf_id);
 	struct interface *ifp;
 	struct eigrp_interface *ei = NULL;
 	struct access_list *alist;
 	struct prefix_list *plist;
 	// struct route_map *routemap;
-	struct eigrp *e;
 
 	/* if no interface address is present, set list to eigrp process struct
 	 */
-	e = eigrp_lookup();
-	assert(e != NULL);
 
 	/* Check if distribute-list was set for process or interface */
 	if (!dist->ifname) {
@@ -126,55 +123,19 @@ void eigrp_distribute_update(struct distribute_ctx *ctx,
 		} else
 			e->prefix[EIGRP_FILTER_OUT] = NULL;
 
-// This is commented out, because the distribute.[ch] code
-// changes looked poorly written from first glance
-// commit was 133bdf2d
-// TODO: DBS
-#if 0
-      /* route-map IN for whole process */
-      if (dist->route[DISTRIBUTE_V4_IN])
-        {
-          routemap = route_map_lookup_by_name (dist->route[DISTRIBUTE_V4_IN]);
-          if (routemap)
-            e->routemap[EIGRP_FILTER_IN] = routemap;
-          else
-            e->routemap[EIGRP_FILTER_IN] = NULL;
-        }
-      else
-        {
-          e->routemap[EIGRP_FILTER_IN] = NULL;
-        }
-
-      /* route-map OUT for whole process */
-      if (dist->route[DISTRIBUTE_V4_OUT])
-        {
-          routemap = route_map_lookup_by_name (dist->route[DISTRIBUTE_V4_OUT]);
-          if (routemap)
-            e->routemap[EIGRP_FILTER_OUT] = routemap;
-          else
-            e->routemap[EIGRP_FILTER_OUT] = NULL;
-        }
-      else
-        {
-          e->routemap[EIGRP_FILTER_OUT] = NULL;
-        }
-#endif
 		// TODO: check Graceful restart after 10sec
 
-		/* check if there is already GR scheduled */
-		if (e->t_distribute != NULL) {
-			/* if is, cancel schedule */
-			thread_cancel(e->t_distribute);
-		}
+		/* cancel GR scheduled */
+		thread_cancel(&(e->t_distribute));
+
 		/* schedule Graceful restart for whole process in 10sec */
-		e->t_distribute = NULL;
 		thread_add_timer(master, eigrp_distribute_timer_process, e,
 				 (10), &e->t_distribute);
 
 		return;
 	}
 
-	ifp = if_lookup_by_name(dist->ifname, VRF_DEFAULT);
+	ifp = if_lookup_by_name(dist->ifname, e->vrf_id);
 	if (ifp == NULL)
 		return;
 
@@ -237,47 +198,13 @@ void eigrp_distribute_update(struct distribute_ctx *ctx,
 	} else
 		ei->prefix[EIGRP_FILTER_OUT] = NULL;
 
-#if 0
-  /* route-map IN for whole process */
-  if (dist->route[DISTRIBUTE_V4_IN])
-    {
-      zlog_info("<DEBUG ACL ALL in");
-      routemap = route_map_lookup_by_name (dist->route[DISTRIBUTE_V4_IN]);
-      if (routemap)
-        ei->routemap[EIGRP_FILTER_IN] = routemap;
-      else
-        ei->routemap[EIGRP_FILTER_IN] = NULL;
-    }
-  else
-    {
-      ei->routemap[EIGRP_FILTER_IN] = NULL;
-    }
-
-  /* route-map OUT for whole process */
-  if (dist->route[DISTRIBUTE_V4_OUT])
-    {
-      routemap = route_map_lookup_by_name (dist->route[DISTRIBUTE_V4_OUT]);
-      if (routemap)
-        ei->routemap[EIGRP_FILTER_OUT] = routemap;
-      else
-        ei->routemap[EIGRP_FILTER_OUT] = NULL;
-    }
-  else
-    {
-      ei->routemap[EIGRP_FILTER_OUT] = NULL;
-    }
-#endif
 	// TODO: check Graceful restart after 10sec
 
-	/* check if there is already GR scheduled */
-	if (ei->t_distribute != NULL) {
-		/* if is, cancel schedule */
-		thread_cancel(ei->t_distribute);
-	}
+	/* Cancel GR scheduled */
+	thread_cancel(&(ei->t_distribute));
 	/* schedule Graceful restart for interface in 10sec */
-	e->t_distribute = NULL;
 	thread_add_timer(master, eigrp_distribute_timer_interface, ei, 10,
-			 &e->t_distribute);
+			 &ei->t_distribute);
 }
 
 /*
@@ -288,7 +215,7 @@ void eigrp_distribute_update_interface(struct interface *ifp)
 	struct distribute *dist;
 	struct eigrp *eigrp;
 
-	eigrp = eigrp_lookup();
+	eigrp = eigrp_lookup(ifp->vrf->vrf_id);
 	if (!eigrp)
 		return;
 	dist = distribute_lookup(eigrp->distribute_ctx, ifp->name);
@@ -302,11 +229,13 @@ void eigrp_distribute_update_interface(struct interface *ifp)
  */
 void eigrp_distribute_update_all(struct prefix_list *notused)
 {
-	struct vrf *vrf = vrf_lookup_by_id(VRF_DEFAULT);
+	struct vrf *vrf;
 	struct interface *ifp;
 
-	FOR_ALL_INTERFACES (vrf, ifp)
-		eigrp_distribute_update_interface(ifp);
+	RB_FOREACH (vrf, vrf_name_head, &vrfs_by_name) {
+		FOR_ALL_INTERFACES (vrf, ifp)
+			eigrp_distribute_update_interface(ifp);
+	}
 }
 
 /*
@@ -322,23 +251,20 @@ void eigrp_distribute_update_all_wrapper(struct access_list *notused)
  *
  * @param[in]   thread  current execution thread timer is associated with
  *
- * @return int  always returns 0
+ * @return void
  *
  * @par
  * Called when 10sec waiting time expire and
  * executes Graceful restart for whole process
  */
-int eigrp_distribute_timer_process(struct thread *thread)
+void eigrp_distribute_timer_process(struct thread *thread)
 {
 	struct eigrp *eigrp;
 
 	eigrp = THREAD_ARG(thread);
-	eigrp->t_distribute = NULL;
 
 	/* execute GR for whole process */
 	eigrp_update_send_process_GR(eigrp, EIGRP_GR_FILTER, NULL);
-
-	return 0;
 }
 
 /*
@@ -346,13 +272,13 @@ int eigrp_distribute_timer_process(struct thread *thread)
  *
  * @param[in]   thread  current execution thread timer is associated with
  *
- * @return int  always returns 0
+ * @return void
  *
  * @par
  * Called when 10sec waiting time expire and
  * executes Graceful restart for interface
  */
-int eigrp_distribute_timer_interface(struct thread *thread)
+void eigrp_distribute_timer_interface(struct thread *thread)
 {
 	struct eigrp_interface *ei;
 
@@ -361,6 +287,4 @@ int eigrp_distribute_timer_interface(struct thread *thread)
 
 	/* execute GR for interface */
 	eigrp_update_send_interface_GR(ei, EIGRP_GR_FILTER, NULL);
-
-	return 0;
 }

@@ -24,7 +24,7 @@
 #include "hook.h"
 #include "nexthop.h"
 #include "distribute.h"
-#include "rip_memory.h"
+#include "memory.h"
 
 /* RIP version number. */
 #define RIPv1                            1
@@ -96,6 +96,8 @@
 /* YANG paths */
 #define RIP_INSTANCE	"/frr-ripd:ripd/instance"
 #define RIP_IFACE	"/frr-interface:lib/interface/frr-ripd:rip"
+
+DECLARE_MGROUP(RIPD);
 
 /* RIP structure. */
 struct rip {
@@ -402,9 +404,6 @@ enum rip_event {
 /* Macro for timer turn on. */
 #define RIP_TIMER_ON(T,F,V) thread_add_timer (master, (F), rinfo, (V), &(T))
 
-/* Macro for timer turn off. */
-#define RIP_TIMER_OFF(X) THREAD_TIMER_OFF(X)
-
 #define RIP_OFFSET_LIST_IN  0
 #define RIP_OFFSET_LIST_OUT 1
 #define RIP_OFFSET_LIST_MAX 2
@@ -519,22 +518,15 @@ extern int offset_list_cmp(struct rip_offset_list *o1,
 
 extern void rip_vrf_init(void);
 extern void rip_vrf_terminate(void);
-
-/* YANG notifications */
-extern void ripd_notif_send_auth_type_failure(const char *ifname);
-extern void ripd_notif_send_auth_failure(const char *ifname);
+extern void rip_cli_init(void);
 
 extern struct zebra_privs_t ripd_privs;
 extern struct rip_instance_head rip_instances;
 
-/* Master thread strucutre. */
+/* Master thread structure. */
 extern struct thread_master *master;
 
-DECLARE_HOOK(rip_ifaddr_add, (struct connected * ifc), (ifc))
-DECLARE_HOOK(rip_ifaddr_del, (struct connected * ifc), (ifc))
-
-/* Northbound. */
-extern void rip_cli_init(void);
-extern const struct frr_yang_module_info frr_ripd_info;
+DECLARE_HOOK(rip_ifaddr_add, (struct connected * ifc), (ifc));
+DECLARE_HOOK(rip_ifaddr_del, (struct connected * ifc), (ifc));
 
 #endif /* _ZEBRA_RIP_H */

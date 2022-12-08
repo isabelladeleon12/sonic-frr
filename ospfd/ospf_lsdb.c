@@ -30,6 +30,7 @@
 #include "ospfd/ospf_asbr.h"
 #include "ospfd/ospf_lsa.h"
 #include "ospfd/ospf_lsdb.h"
+#include "ospfd/ospf_orr.h"
 
 struct ospf_lsdb *ospf_lsdb_new(void)
 {
@@ -70,7 +71,7 @@ void ospf_lsdb_cleanup(struct ospf_lsdb *lsdb)
 void ls_prefix_set(struct prefix_ls *lp, struct ospf_lsa *lsa)
 {
 	if (lp && lsa && lsa->data) {
-		lp->family = 0;
+		lp->family = AF_UNSPEC;
 		lp->prefixlen = 64;
 		lp->id = lsa->data->id;
 		lp->adv_router = lsa->data->adv_router;
@@ -86,6 +87,10 @@ static void ospf_lsdb_delete_entry(struct ospf_lsdb *lsdb,
 		return;
 
 	assert(rn->table == lsdb->type[lsa->data->type].db);
+
+	/* Update ORR Root table MPLS-TE Router address's advertise router */
+	if (lsa->data->type == OSPF_OPAQUE_AREA_LSA)
+		ospf_orr_root_table_update(lsa, false);
 
 	if (IS_LSA_SELF(lsa))
 		lsdb->type[lsa->data->type].count_self--;
@@ -134,6 +139,10 @@ void ospf_lsdb_add(struct ospf_lsdb *lsdb, struct ospf_lsa *lsa)
 #endif /* MONITOR_LSDB_CHANGE */
 	lsdb->type[lsa->data->type].checksum += ntohs(lsa->data->checksum);
 	rn->info = ospf_lsa_lock(lsa); /* lsdb */
+
+	/* Update ORR Root table MPLS-TE Router address's advertise router */
+	if (lsa->data->type == OSPF_OPAQUE_AREA_LSA)
+		ospf_orr_root_table_update(lsa, true);
 }
 
 void ospf_lsdb_delete(struct ospf_lsdb *lsdb, struct ospf_lsa *lsa)
@@ -198,8 +207,8 @@ struct ospf_lsa *ospf_lsdb_lookup_by_id(struct ospf_lsdb *lsdb, uint8_t type,
 
 	table = lsdb->type[type].db;
 
-	memset(&lp, 0, sizeof(struct prefix_ls));
-	lp.family = 0;
+	memset(&lp, 0, sizeof(lp));
+	lp.family = AF_UNSPEC;
 	lp.prefixlen = 64;
 	lp.id = id;
 	lp.adv_router = adv_router;
@@ -225,8 +234,8 @@ struct ospf_lsa *ospf_lsdb_lookup_by_id_next(struct ospf_lsdb *lsdb,
 
 	table = lsdb->type[type].db;
 
-	memset(&lp, 0, sizeof(struct prefix_ls));
-	lp.family = 0;
+	memset(&lp, 0, sizeof(lp));
+	lp.family = AF_UNSPEC;
 	lp.prefixlen = 64;
 	lp.id = id;
 	lp.adv_router = adv_router;

@@ -22,7 +22,7 @@
 #ifndef _ZEBRA_OSPF_ABR_H
 #define _ZEBRA_OSPF_ABR_H
 
-#define OSPF_ABR_TASK_DELAY 	7
+#define OSPF_ABR_TASK_DELAY 	5
 
 #define OSPF_AREA_RANGE_ADVERTISE	(1 << 0)
 #define OSPF_AREA_RANGE_SUBSTITUTE	(1 << 1)
@@ -83,4 +83,5 @@ extern void ospf_schedule_abr_task(struct ospf *);
 
 extern void ospf_abr_announce_network_to_area(struct prefix_ipv4 *, uint32_t,
 					      struct ospf_area *);
+extern void ospf_abr_nssa_check_status(struct ospf *ospf);
 #endif /* _ZEBRA_OSPF_ABR_H */

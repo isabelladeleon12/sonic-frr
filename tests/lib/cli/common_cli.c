@@ -25,7 +25,7 @@
 #include "vty.h"
 #include "command.h"
 #include "memory.h"
-#include "memory_vty.h"
+#include "lib_vty.h"
 #include "log.h"
 
 #include "common_cli.h"
@@ -53,17 +53,20 @@ static void vty_do_exit(int isexit)
 	nb_terminate();
 	yang_terminate();
 	thread_master_free(master);
-	closezlog();
 
 	log_memstats(stderr, "testcli");
 	if (!isexit)
 		exit(0);
 }
 
+const struct frr_yang_module_info *const *test_yang_modules = NULL;
+int test_log_prio = ZLOG_DISABLED;
+
 /* main routine. */
 int main(int argc, char **argv)
 {
 	struct thread thread;
+	size_t yangcount;
 
 	/* Set umask before anything for security */
 	umask(0027);
@@ -71,21 +74,20 @@ int main(int argc, char **argv)
 	/* master init. */
 	master = thread_master_create(NULL);
 
-	openzlog("common-cli", "NONE", 0, LOG_CONS | LOG_NDELAY | LOG_PID,
-		 LOG_DAEMON);
-	zlog_set_level(ZLOG_DEST_SYSLOG, ZLOG_DISABLED);
-	zlog_set_level(ZLOG_DEST_STDOUT, ZLOG_DISABLED);
-	zlog_set_level(ZLOG_DEST_MONITOR, LOG_DEBUG);
+	zlog_aux_init("NONE: ", test_log_prio);
 
 	/* Library inits. */
 	cmd_init(1);
 	cmd_hostname_set("test");
 	cmd_domainname_set("test.domain");
 
-	vty_init(master);
-	memory_init();
-	yang_init();
-	nb_init(master, NULL, 0);
+	vty_init(master, false);
+	lib_cmd_init();
+
+	for (yangcount = 0; test_yang_modules && test_yang_modules[yangcount];
+	     yangcount++)
+		;
+	nb_init(master, test_yang_modules, yangcount, false);
 
 	test_init(argc, argv);
 

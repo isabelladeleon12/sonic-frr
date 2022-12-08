@@ -41,6 +41,11 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include <string.h>
 #include "typerb.h"
 
 #define RB_BLACK	0
@@ -326,12 +331,14 @@ color:
 		rbe_remove_color(rbt, parent, child);
 
 	rbt->count--;
+	memset(old, 0, sizeof(*old));
 	return (old);
 }
 
-void typed_rb_remove(struct rbt_tree *rbt, struct rb_entry *rbe)
+struct typed_rb_entry *typed_rb_remove(struct rbt_tree *rbt,
+				       struct rb_entry *rbe)
 {
-	rbe_remove(rbt, rbe);
+	return rbe_remove(rbt, rbe);
 }
 
 struct typed_rb_entry *typed_rb_insert(struct rbt_tree *rbt,
@@ -372,12 +379,13 @@ struct typed_rb_entry *typed_rb_insert(struct rbt_tree *rbt,
 }
 
 /* Finds the node with the same key as elm */
-struct rb_entry *typed_rb_find(struct rbt_tree *rbt, const struct rb_entry *key,
+const struct rb_entry *typed_rb_find(const struct rbt_tree *rbt,
+		const struct rb_entry *key,
 		int (*cmpfn)(
 			const struct typed_rb_entry *a,
 			const struct typed_rb_entry *b))
 {
-	struct rb_entry *tmp = RBH_ROOT(rbt);
+	const struct rb_entry *tmp = RBH_ROOT(rbt);
 	int comp;
 
 	while (tmp != NULL) {
@@ -390,16 +398,16 @@ struct rb_entry *typed_rb_find(struct rbt_tree *rbt, const struct rb_entry *key,
 			return tmp;
 	}
 
-	return (NULL);
+	return NULL;
 }
 
-struct rb_entry *typed_rb_find_gteq(struct rbt_tree *rbt,
+const struct rb_entry *typed_rb_find_gteq(const struct rbt_tree *rbt,
 		const struct rb_entry *key,
 		int (*cmpfn)(
 			const struct typed_rb_entry *a,
 			const struct typed_rb_entry *b))
 {
-	struct rb_entry *tmp = RBH_ROOT(rbt), *best = NULL;
+	const struct rb_entry *tmp = RBH_ROOT(rbt), *best = NULL;
 	int comp;
 
 	while (tmp != NULL) {
@@ -416,13 +424,13 @@ struct rb_entry *typed_rb_find_gteq(struct rbt_tree *rbt,
 	return best;
 }
 
-struct rb_entry *typed_rb_find_lt(struct rbt_tree *rbt,
+const struct rb_entry *typed_rb_find_lt(const struct rbt_tree *rbt,
 		const struct rb_entry *key,
 		int (*cmpfn)(
 			const struct typed_rb_entry *a,
 			const struct typed_rb_entry *b))
 {
-	struct rb_entry *tmp = RBH_ROOT(rbt), *best = NULL;
+	const struct rb_entry *tmp = RBH_ROOT(rbt), *best = NULL;
 	int comp;
 
 	while (tmp != NULL) {
@@ -438,8 +446,10 @@ struct rb_entry *typed_rb_find_lt(struct rbt_tree *rbt,
 	return best;
 }
 
-struct rb_entry *typed_rb_next(struct rb_entry *rbe)
+struct rb_entry *typed_rb_next(const struct rb_entry *rbe_const)
 {
+	struct rb_entry *rbe = (struct rb_entry *)rbe_const;
+
 	if (RBE_RIGHT(rbe) != NULL) {
 		rbe = RBE_RIGHT(rbe);
 		while (RBE_LEFT(rbe) != NULL)
@@ -458,7 +468,29 @@ struct rb_entry *typed_rb_next(struct rb_entry *rbe)
 	return rbe;
 }
 
-struct rb_entry *typed_rb_min(struct rbt_tree *rbt)
+struct rb_entry *typed_rb_prev(const struct rb_entry *rbe_const)
+{
+	struct rb_entry *rbe = (struct rb_entry *)rbe_const;
+
+	if (RBE_LEFT(rbe)) {
+		rbe = RBE_LEFT(rbe);
+		while (RBE_RIGHT(rbe))
+			rbe = RBE_RIGHT(rbe);
+	} else {
+		if (RBE_PARENT(rbe) && (rbe == RBE_RIGHT(RBE_PARENT(rbe))))
+			rbe = RBE_PARENT(rbe);
+		else {
+			while (RBE_PARENT(rbe)
+			       && (rbe == RBE_LEFT(RBE_PARENT(rbe))))
+				rbe = RBE_PARENT(rbe);
+			rbe = RBE_PARENT(rbe);
+		}
+	}
+
+	return rbe;
+}
+
+struct rb_entry *typed_rb_min(const struct rbt_tree *rbt)
 {
 	struct rb_entry *rbe = RBH_ROOT(rbt);
 	struct rb_entry *parent = NULL;
@@ -469,4 +501,25 @@ struct rb_entry *typed_rb_min(struct rbt_tree *rbt)
 	}
 
 	return parent;
+}
+
+struct rb_entry *typed_rb_max(const struct rbt_tree *rbt)
+{
+	struct rb_entry *rbe = RBH_ROOT(rbt);
+	struct rb_entry *parent = NULL;
+
+	while (rbe != NULL) {
+		parent = rbe;
+		rbe = RBE_RIGHT(rbe);
+	}
+
+	return parent;
+}
+
+bool typed_rb_member(const struct typed_rb_root *rbt,
+		     const struct typed_rb_entry *rbe)
+{
+	while (rbe->rbt_parent)
+		rbe = rbe->rbt_parent;
+	return rbe == rbt->rbt_root;
 }

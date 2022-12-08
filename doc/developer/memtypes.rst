@@ -15,15 +15,15 @@ Example:
 .. code-block:: c
    :caption: mydaemon.h
 
-   DECLARE_MGROUP(MYDAEMON)
-   DECLARE_MTYPE(MYNEIGHBOR)
+   DECLARE_MGROUP(MYDAEMON);
+   DECLARE_MTYPE(MYNEIGHBOR);
 
 .. code-block:: c
    :caption: mydaemon.c
 
-   DEFINE_MGROUP(      MYDAEMON, "My daemon's memory")
-   DEFINE_MTYPE(       MYDAEMON, MYNEIGHBOR,     "Neighbor entry")
-   DEFINE_MTYPE_STATIC(MYDAEMON, MYNEIGHBORNAME, "Neighbor name")
+   DEFINE_MGROUP(      MYDAEMON, "My daemon's memory");
+   DEFINE_MTYPE(       MYDAEMON, MYNEIGHBOR,     "Neighbor entry");
+   DEFINE_MTYPE_STATIC(MYDAEMON, MYNEIGHBORNAME, "Neighbor name");
 
    struct neigh *neighbor_new(const char *name)
    {
@@ -41,6 +41,22 @@ Example:
 
 Definition
 ----------
+
+.. c:struct:: memtype
+
+   This is the (internal) type used for MTYPE definitions.  The macros below
+   should be used to create these, but in some cases it is useful to pass a
+   ``struct memtype *`` pointer to some helper function.
+
+   The ``MTYPE_name`` created by the macros is declared as a pointer, i.e.
+   a function taking a ``struct memtype *`` argument can be called with an
+   ``MTYPE_name`` argument (as opposed to ``&MTYPE_name``.)
+
+   .. note::
+
+      As ``MTYPE_name`` is a variable assigned from ``&_mt_name`` and not a
+      constant expression, it cannot be used as initializer for static
+      variables. In the case please fall back to ``&_mt_name``.
 
 .. c:macro:: DECLARE_MGROUP(name)
 
@@ -115,3 +131,10 @@ Usage
    - if ptr is NULL, no operation is performed (as is guaranteed by system
      implementations.)  Do not surround XFREE with ``if (ptr != NULL)``
      checks.
+
+.. c:function:: void XCOUNTFREE(struct memtype *mtype, void *ptr)
+
+   This macro is used to count the ``ptr`` as freed without actually freeing
+   it. This may be needed in some very specific cases, for example, when the
+   ``ptr`` was allocated using any of the above wrappers and will be freed
+   by some external library using simple ``free()``.

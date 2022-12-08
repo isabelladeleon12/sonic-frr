@@ -18,14 +18,21 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
+#include "zebra.h"
 
 #include <string.h>
 #include <ctype.h>
 #include <sys/types.h>
+#ifdef HAVE_LIBPCRE2_POSIX
+#ifndef _FRR_PCRE2_POSIX
+#define _FRR_PCRE2_POSIX
+#include <pcre2posix.h>
+#endif /* _FRR_PCRE2_POSIX */
+#elif defined(HAVE_LIBPCREPOSIX)
+#include <pcreposix.h>
+#else
 #include <regex.h>
+#endif /* HAVE_LIBPCRE2_POSIX */
 
 #include "frrstr.h"
 #include "memory.h"
@@ -152,7 +159,33 @@ void frrstr_strvec_free(vector v)
 	vector_free(v);
 }
 
-bool begins_with(const char *str, const char *prefix)
+char *frrstr_replace(const char *str, const char *find, const char *replace)
+{
+	char *ch;
+	char *nustr = XSTRDUP(MTYPE_TMP, str);
+
+	size_t findlen = strlen(find);
+	size_t repllen = strlen(replace);
+
+	while ((ch = strstr(nustr, find))) {
+		if (repllen > findlen) {
+			size_t nusz = strlen(nustr) + repllen - findlen + 1;
+			nustr = XREALLOC(MTYPE_TMP, nustr, nusz);
+			ch = strstr(nustr, find);
+		}
+
+		size_t nustrlen = strlen(nustr);
+		size_t taillen = (nustr + nustrlen) - (ch + findlen);
+
+		memmove(ch + findlen + (repllen - findlen), ch + findlen,
+			taillen + 1);
+		memcpy(ch, replace, repllen);
+	}
+
+	return nustr;
+}
+
+bool frrstr_startswith(const char *str, const char *prefix)
 {
 	if (!str || !prefix)
 		return false;
@@ -166,10 +199,42 @@ bool begins_with(const char *str, const char *prefix)
 	return strncmp(str, prefix, lenprefix) == 0;
 }
 
+bool frrstr_endswith(const char *str, const char *suffix)
+{
+	if (!str || !suffix)
+		return false;
+
+	size_t lenstr = strlen(str);
+	size_t lensuffix = strlen(suffix);
+
+	if (lensuffix > lenstr)
+		return false;
+
+	return strncmp(&str[lenstr - lensuffix], suffix, lensuffix) == 0;
+}
+
 int all_digit(const char *str)
 {
 	for (; *str != '\0'; str++)
-		if (!isdigit((int)*str))
+		if (!isdigit((unsigned char)*str))
 			return 0;
 	return 1;
+}
+
+
+char *frrstr_hex(char *buff, size_t bufsiz, const uint8_t *str, size_t num)
+{
+	if (bufsiz == 0)
+		return buff;
+
+	char tmp[3];
+
+	buff[0] = '\0';
+
+	for (size_t i = 0; i < num; i++) {
+		snprintf(tmp, sizeof(tmp), "%02x", (unsigned char)str[i]);
+		strlcat(buff, tmp, bufsiz);
+	}
+
+	return buff;
 }

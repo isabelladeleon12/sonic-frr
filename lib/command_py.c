@@ -22,6 +22,15 @@
  * memory leak or SEGV for things that haven't been well-tested.
  */
 
+/* This file is "exempt" from having
+#include "config.h"
+ * as the first include statement because Python.h also does environment
+ * setup & these trample over each other.
+ */
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 #include <Python.h>
 #include "structmember.h"
 #include <string.h>
@@ -191,25 +200,34 @@ static PyObject *graph_to_pyobj(struct wrap_graph *wgraph,
 	if (gn->data) {
 		struct cmd_token *tok = gn->data;
 		switch (tok->type) {
-#define item(x) case x: wrap->type = #x; break;
-			item(WORD_TKN)		      // words
-				item(VARIABLE_TKN)    // almost anything
-				item(RANGE_TKN)       // integer range
-				item(IPV4_TKN)	// IPV4 addresses
-				item(IPV4_PREFIX_TKN) // IPV4 network prefixes
-				item(IPV6_TKN)	// IPV6 prefixes
-				item(IPV6_PREFIX_TKN) // IPV6 network prefixes
-				item(MAC_TKN)	 // MAC address
-				item(MAC_PREFIX_TKN)  // MAC address with mask
+#define item(x)                                                                \
+	case x:                                                                \
+		wrap->type = #x;                                               \
+		break /* no semicolon */
 
-				/* plumbing types */
-				item(FORK_TKN) item(JOIN_TKN) item(START_TKN)
-					item(END_TKN) default
-				: wrap->type = "???";
+			item(WORD_TKN);	       // words
+			item(VARIABLE_TKN);    // almost anything
+			item(RANGE_TKN);       // integer range
+			item(IPV4_TKN);	       // IPV4 addresses
+			item(IPV4_PREFIX_TKN); // IPV4 network prefixes
+			item(IPV6_TKN);	       // IPV6 prefixes
+			item(IPV6_PREFIX_TKN); // IPV6 network prefixes
+			item(MAC_TKN);	       // MAC address
+			item(MAC_PREFIX_TKN);  // MAC address with mask
+
+			/* plumbing types */
+			item(FORK_TKN);
+			item(JOIN_TKN);
+			item(START_TKN);
+			item(END_TKN);
+			item(NEG_ONLY_TKN);
+#undef item
+		default:
+			wrap->type = "???";
 		}
 
-		wrap->deprecated = (tok->attr == CMD_ATTR_DEPRECATED);
-		wrap->hidden = (tok->attr == CMD_ATTR_HIDDEN);
+		wrap->deprecated = !!(tok->attr & CMD_ATTR_DEPRECATED);
+		wrap->hidden = !!(tok->attr & CMD_ATTR_HIDDEN);
 		wrap->text = tok->text;
 		wrap->desc = tok->desc;
 		wrap->varname = tok->varname;
@@ -321,6 +339,7 @@ static struct PyModuleDef pymoddef_clippy = {
 	} while (0)
 #endif
 
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
 PyMODINIT_FUNC command_py_init(void)
 {
 	PyObject *pymod;
@@ -334,9 +353,17 @@ PyMODINIT_FUNC command_py_init(void)
 	if (!pymod)
 		initret(NULL);
 
+	if (PyModule_AddIntMacro(pymod, CMD_ATTR_YANG)
+	    || PyModule_AddIntMacro(pymod, CMD_ATTR_HIDDEN)
+	    || PyModule_AddIntMacro(pymod, CMD_ATTR_DEPRECATED)
+	    || PyModule_AddIntMacro(pymod, CMD_ATTR_NOSH))
+		initret(NULL);
+
 	Py_INCREF(&typeobj_graph_node);
 	PyModule_AddObject(pymod, "GraphNode", (PyObject *)&typeobj_graph_node);
 	Py_INCREF(&typeobj_graph);
 	PyModule_AddObject(pymod, "Graph", (PyObject *)&typeobj_graph);
+	if (!elf_py_init(pymod))
+		initret(NULL);
 	initret(pymod);
 }

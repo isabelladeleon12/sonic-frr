@@ -26,6 +26,7 @@
 
 #include <zebra/zebra_ns.h>
 #include <zebra/zebra_pw.h>
+#include <zebra/rtadv.h>
 #include <lib/vxlan.h>
 
 #ifdef __cplusplus
@@ -33,14 +34,26 @@ extern "C" {
 #endif
 
 /* MPLS (Segment Routing) global block */
-typedef struct mpls_srgb_t_ {
+struct mpls_srgb {
 	uint32_t start_label;
 	uint32_t end_label;
-} mpls_srgb_t;
+};
 
 struct zebra_rmap {
 	char *name;
 	struct route_map *map;
+};
+
+PREDECL_RBTREE_UNIQ(otable);
+
+struct other_route_table {
+	struct otable_item next;
+
+	afi_t afi;
+	safi_t safi;
+	uint32_t table_id;
+
+	struct route_table *table;
 };
 
 /* Routing table instance.  */
@@ -57,6 +70,7 @@ struct zebra_vrf {
 	/* Flags. */
 	uint16_t flags;
 #define ZEBRA_VRF_RETAIN          (1 << 0)
+#define ZEBRA_PIM_SEND_VXLAN_SG   (1 << 1)
 
 	uint32_t table_id;
 
@@ -65,9 +79,9 @@ struct zebra_vrf {
 
 	/* Recursive Nexthop table */
 	struct route_table *rnh_table[AFI_MAX];
+	struct route_table *rnh_table_multicast[AFI_MAX];
 
-	/* Import check table (used mostly by BGP */
-	struct route_table *import_check_table[AFI_MAX];
+	struct otable_head other_tables;
 
 	/* 2nd pointer type used primarily to quell a warning on
 	 * ALL_LIST_ELEMENTS_RO
@@ -77,6 +91,11 @@ struct zebra_vrf {
 	struct list *rid_all_sorted_list;
 	struct list *rid_lo_sorted_list;
 	struct prefix rid_user_assigned;
+	struct list _rid6_all_sorted_list;
+	struct list _rid6_lo_sorted_list;
+	struct list *rid6_all_sorted_list;
+	struct list *rid6_lo_sorted_list;
+	struct prefix rid6_user_assigned;
 
 	/*
 	 * Back pointer to the owning namespace.
@@ -85,6 +104,7 @@ struct zebra_vrf {
 
 	/* MPLS Label to handle L3VPN <-> vrf popping */
 	mpls_label_t label[AFI_MAX];
+	uint8_t label_proto[AFI_MAX];
 
 	/* MPLS static LSP config table */
 	struct hash *slsp_table;
@@ -96,7 +116,7 @@ struct zebra_vrf {
 	struct route_table *fec_table[AFI_MAX];
 
 	/* MPLS Segment Routing Global block */
-	mpls_srgb_t mpls_srgb;
+	struct mpls_srgb mpls_srgb;
 
 	/* Pseudowires. */
 	struct zebra_pw_head pseudowires;
@@ -110,9 +130,9 @@ struct zebra_vrf {
 #define MPLS_FLAG_SCHEDULE_LSPS    (1 << 0)
 
 	/*
-	 * VNI hash table (for EVPN). Only in the EVPN instance.
+	 * EVPN hash table. Only in the EVPN instance.
 	 */
-	struct hash *vni_table;
+	struct hash *evpn_table;
 
 	/*
 	 * Whether EVPN is enabled or not. Only in the EVPN instance.
@@ -155,6 +175,13 @@ struct zebra_vrf {
 	uint64_t lsp_removals_queued;
 	uint64_t lsp_installs;
 	uint64_t lsp_removals;
+
+	struct table_manager *tbl_mgr;
+
+	struct rtadv rtadv;
+
+	bool zebra_rnh_ip_default_route;
+	bool zebra_rnh_ipv6_default_route;
 };
 #define PROTO_RM_NAME(zvrf, afi, rtype) zvrf->proto_rm[afi][rtype].name
 #define NHT_RM_NAME(zvrf, afi, rtype) zvrf->nht_rm[afi][rtype].name
@@ -164,14 +191,15 @@ struct zebra_vrf {
 /*
  * special macro to allow us to get the correct zebra_vrf
  */
-#define ZEBRA_DECLVAR_CONTEXT(A, B)                                            \
-	struct vrf *A = VTY_GET_CONTEXT(vrf);                                  \
-	struct zebra_vrf *B = (A) ? A->info : vrf_info_lookup(VRF_DEFAULT)
+#define ZEBRA_DECLVAR_CONTEXT_VRF(vrfptr, zvrfptr)                             \
+	VTY_DECLVAR_CONTEXT_VRF(vrfptr);                                       \
+	struct zebra_vrf *zvrfptr = vrfptr->info;                              \
+	MACRO_REQUIRE_SEMICOLON() /* end */
 
 static inline vrf_id_t zvrf_id(struct zebra_vrf *zvrf)
 {
 	if (!zvrf || !zvrf->vrf)
-		return VRF_UNKNOWN;
+		return VRF_DEFAULT;
 	return zvrf->vrf->vrf_id;
 }
 
@@ -184,6 +212,8 @@ static inline const char *zvrf_ns_name(struct zebra_vrf *zvrf)
 
 static inline const char *zvrf_name(struct zebra_vrf *zvrf)
 {
+	if (!zvrf || !zvrf->vrf)
+		return "Unknown";
 	return zvrf->vrf->name;
 }
 
@@ -192,19 +222,47 @@ static inline bool zvrf_is_active(struct zebra_vrf *zvrf)
 	return zvrf->vrf->status & VRF_ACTIVE;
 }
 
-struct route_table *zebra_vrf_table_with_table_id(afi_t afi, safi_t safi,
-						  vrf_id_t vrf_id,
-						  uint32_t table_id);
+static inline int
+zvrf_other_table_compare_func(const struct other_route_table *a,
+			      const struct other_route_table *b)
+{
+	if (a->afi != b->afi)
+		return a->afi - b->afi;
+
+	if (a->safi != b->safi)
+		return a->safi - b->safi;
+
+	if (a->table_id != b->table_id)
+		return a->table_id - b->table_id;
+
+	return 0;
+}
+
+DECLARE_RBTREE_UNIQ(otable, struct other_route_table, next,
+		    zvrf_other_table_compare_func);
+
+extern struct route_table *
+zebra_vrf_lookup_table_with_table_id(afi_t afi, safi_t safi, vrf_id_t vrf_id,
+				     uint32_t table_id);
+extern struct route_table *zebra_vrf_get_table_with_table_id(afi_t afi,
+							     safi_t safi,
+							     vrf_id_t vrf_id,
+							     uint32_t table_id);
 
 extern void zebra_vrf_update_all(struct zserv *client);
 extern struct zebra_vrf *zebra_vrf_lookup_by_id(vrf_id_t vrf_id);
 extern struct zebra_vrf *zebra_vrf_lookup_by_name(const char *);
-extern struct zebra_vrf *zebra_vrf_alloc(void);
+extern struct zebra_vrf *zebra_vrf_alloc(struct vrf *vrf);
 extern struct route_table *zebra_vrf_table(afi_t, safi_t, vrf_id_t);
 
-extern struct route_table *
-zebra_vrf_other_route_table(afi_t afi, uint32_t table_id, vrf_id_t vrf_id);
-extern int zebra_vrf_has_config(struct zebra_vrf *zvrf);
+/*
+ * API to associate a VRF with a NETNS.
+ * Called either from vty or through discovery.
+ */
+extern int zebra_vrf_netns_handler_create(struct vty *vty, struct vrf *vrf,
+					  char *pathname, ns_id_t ext_ns_id,
+					  ns_id_t ns_id, ns_id_t rel_def_ns_id);
+
 extern void zebra_vrf_init(void);
 
 extern void zebra_rtable_node_cleanup(struct route_table *table,

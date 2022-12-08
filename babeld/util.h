@@ -27,6 +27,9 @@ THE SOFTWARE.
 #include "babeld.h"
 #include "babel_main.h"
 #include "log.h"
+#include "memory.h"
+
+DECLARE_MGROUP(BABELD);
 
 #if defined(i386) || defined(__mc68020__) || defined(__x86_64__)
 #define DO_NTOHS(_d, _s) do{ _d = ntohs(*(const unsigned short*)(_s)); }while(0)
@@ -97,9 +100,6 @@ void timeval_min(struct timeval *d, const struct timeval *s);
 void timeval_min_sec(struct timeval *d, time_t secs);
 int parse_nat(const char *string) ATTRIBUTE ((pure));
 int parse_msec(const char *string) ATTRIBUTE ((pure));
-int in_prefix(const unsigned char *restrict address,
-              const unsigned char *restrict prefix, unsigned char plen)
-    ATTRIBUTE ((pure));
 unsigned char *mask_prefix(unsigned char *restrict ret,
                            const unsigned char *restrict prefix,
                            unsigned char plen);
@@ -119,20 +119,14 @@ void uchar_to_inaddr(struct in_addr *dest, const unsigned char *src);
 void in6addr_to_uchar(unsigned char *dest, const struct in6_addr *src);
 void uchar_to_in6addr(struct in6_addr *dest, const unsigned char *src);
 int daemonise(void);
-const unsigned char v4prefix[16];
+extern const unsigned char v4prefix[16];
 
 /* If debugging is disabled, we want to avoid calling format_address
    for every omitted debugging message.  So debug is a macro.  But
    vararg macros are not portable. */
 #if defined NO_DEBUG
 
-#if defined __STDC_VERSION__ && __STDC_VERSION__ >= 199901L
 #define debugf(...) do {} while(0)
-#elif defined __GNUC__
-#define debugf(_args...) do {} while(0)
-#else
-static inline void debugf(int level, const char *format, ...) { return; }
-#endif
 
 #else /* NO_DEBUG */
 
@@ -145,19 +139,10 @@ static inline void debugf(int level, const char *format, ...) { return; }
 #define BABEL_DEBUG_ROUTE       (1 << 5)
 #define BABEL_DEBUG_ALL         (0xFFFF)
 
-#if defined __STDC_VERSION__ && __STDC_VERSION__ >= 199901L
 #define debugf(level, ...) \
 do { \
 if(UNLIKELY(debug & level)) zlog_debug(__VA_ARGS__);     \
 } while(0)
-#elif defined __GNUC__
-#define debugf(level, _args...) \
-do { \
-if(UNLIKELY(debug & level)) zlog_debug(_args);   \
-} while(0)
-#else
-static inline void debugf(int level, const char *format, ...) { return; }
-#endif
 
 #endif /* NO_DEBUG */
 

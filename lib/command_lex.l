@@ -35,7 +35,7 @@
 #pragma GCC diagnostic ignored "-Wsign-compare"
 #pragma GCC diagnostic ignored "-Wmissing-prototypes"
 
-#include "command_parse.h"
+#include "lib/command_parse.h"
 
 #define YY_USER_ACTION yylloc->last_column += yyleng;
 #define LOC_STEP do { if (yylloc) { \
@@ -82,10 +82,11 @@ RANGE           \({NUMBER}[ ]?\-[ ]?{NUMBER}\)
 {VARIABLE}      {yylval->string = XSTRDUP(MTYPE_LEX, yytext); return VARIABLE;}
 {WORD}          {yylval->string = XSTRDUP(MTYPE_LEX, yytext); return WORD;}
 {RANGE}         {yylval->string = XSTRDUP(MTYPE_LEX, yytext); return RANGE;}
+!\[             {yylval->string = NULL; return EXCL_BRACKET;}
 .               {return yytext[0];}
 %%
 
-YY_BUFFER_STATE buffer;
+static YY_BUFFER_STATE buffer;
 
 void set_lexer_string (yyscan_t *scn, const char *string)
 {

@@ -39,7 +39,7 @@ static struct log_ref ferr_ospf_warn[] = {
 	},
 	{
 		.code = EC_OSPF_PACKET,
-		.title = "OSPF has detected packet information missmatch",
+		.title = "OSPF has detected packet information mismatch",
 		.description = "OSPF has detected that packet information received is incorrect",
 		.suggestion = "Ensure interface configuration is correct, gather log files from here and the peer and open an Issue",
 	},
@@ -155,6 +155,12 @@ static struct log_ref ferr_ospf_err[] = {
 		.code = EC_OSPF_SR_INVALID_LSA_ID,
 		.title = "OSPF SR Invalid LSA ID",
 		.description = "OSPF Segment Routing invalid lsa id",
+		.suggestion = "Restart OSPF instance, If the problem persists, report the problem for troubleshooting"
+	},
+	{
+		.code = EC_OSPF_SR_SID_OVERFLOW,
+		.title = "OSPF SR Segment-ID overflow",
+		.description = "OSPF Segment Routing ID index or label exceed Global or Local Block Range",
 		.suggestion = "Restart OSPF instance, If the problem persists, report the problem for troubleshooting"
 	},
 	{
