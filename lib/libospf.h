@@ -36,7 +36,7 @@ extern "C" {
 #define IPPROTO_OSPFIGP         89
 #endif /* IPPROTO_OSPFIGP */
 
-/* Architectual Constants */
+/* Architectural Constants */
 #ifdef DEBUG
 #define OSPF_LS_REFRESH_TIME                   120
 #else
@@ -52,6 +52,7 @@ extern "C" {
 #define OSPF_DEFAULT_DESTINATION        0x00000000      /* 0.0.0.0 */
 #define OSPF_INITIAL_SEQUENCE_NUMBER    0x80000001U
 #define OSPF_MAX_SEQUENCE_NUMBER        0x7fffffffU
+#define OSPF_INVALID_SEQUENCE_NUMBER 0x80000000U
 
 /* OSPF Interface Types */
 #define OSPF_IFTYPE_NONE		0

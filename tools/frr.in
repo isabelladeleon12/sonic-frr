@@ -21,11 +21,13 @@ VTYSH="@vtysh_bin@" # /usr/bin/vtysh
 FRR_USER="@enable_user@" # frr
 FRR_GROUP="@enable_group@" # frr
 FRR_VTY_GROUP="@enable_vty_group@" # frrvty
+FRR_CONFIG_MODE="@enable_configfile_mask@" # 0600
+FRR_DEFAULT_PROFILE="@DFLT_NAME@" # traditional / datacenter
 
 # Local Daemon selection may be done by using /etc/frr/daemons.
 # See /usr/share/doc/frr/README.Debian.gz for further information.
 # Keep zebra first and do not list watchfrr!
-DAEMONS="zebra bgpd ripd ripngd ospfd ospf6d isisd babeld pimd ldpd nhrpd eigrpd sharpd pbrd staticd bfdd fabricd"
+DAEMONS="zebra bgpd ripd ripngd ospfd ospf6d isisd babeld pimd pim6d ldpd nhrpd eigrpd sharpd pbrd staticd bfdd fabricd vrrpd pathd"
 MAX_INSTANCES=5
 RELOAD_SCRIPT="$D_PATH/frr-reload.py"
 
@@ -51,12 +53,6 @@ vtyfile()
 	echo "$V_PATH/$1.vty"
 }
 
-chownfrr()
-{
-	test -n "$FRR_USER" && chown "$FRR_USER" "$1"
-	test -n "$FRR_GROUP" && chgrp "$FRR_GROUP" "$1"
-}
-
 # Check if daemon is started by using the pidfile.
 started()
 {
@@ -74,7 +70,7 @@ vtysh_b ()
 {
 	# Rember, that all variables have been incremented by 1 in convert_daemon_prios()
 	if [ "$vtysh_enable" = 2 -a -f $C_PATH/frr.conf ]; then
-		$VTYSH -b -n
+		$VTYSH -b
 	fi
 }
 
@@ -100,12 +96,10 @@ check_daemon()
 		# check for config file
 		if [ -n "$2" ]; then
 			if [ ! -r "$C_PATH/$1-$2.conf" ]; then
-				touch "$C_PATH/$1-$2.conf"
-				chownfrr "$C_PATH/$1-$2.conf"
+				install -g "$FRR_GROUP" -o "$FRR_USER" -m "$FRR_CONFIG_MODE" /dev/null "$C_PATH/$1-$2.conf"
 			fi
 		elif [ ! -r "$C_PATH/$1.conf" ]; then
-			touch "$C_PATH/$1.conf"
-			chownfrr "$C_PATH/$1.conf"
+			install -g "$FRR_GROUP" -o "$FRR_USER" -m "$FRR_CONFIG_MODE" /dev/null "$C_PATH/$1.conf"
 		fi
 	fi
 	return 0
@@ -151,7 +145,7 @@ start()
 			--pidfile=`pidfile $dmn-$inst` \
 			--exec "$D_PATH/$dmn" \
 			-- \
-			`eval echo "$""$dmn""_options"` -n "$inst"
+			`eval echo "$""$dmn""_options"` $frr_global_options -n "$inst"
 	else
 		if ! check_daemon $dmn; then
 			echo -n " (binary does not exist)"
@@ -164,14 +158,14 @@ start()
 				--pidfile=`pidfile $dmn` \
 				--exec "$valgrind" \
 				-- --trace-children=no --leak-check=full --log-file=/var/log/frr/$dmn-valgrind.log $D_PATH/$dmn \
-				`eval echo "$""$dmn""_options"`
+				`eval echo "$""$dmn""_options"` $frr_global_options
 		else
 			${SSD} \
 				--start \
 				--pidfile=`pidfile $dmn` \
 				--exec "$D_PATH/$dmn" \
 				-- \
-				`eval echo "$""$dmn""_options"`
+				`eval echo "$""$dmn""_options"` $frr_global_options
 		fi
 	fi
 
@@ -188,7 +182,7 @@ start()
 			--pidfile=`pidfile staticd` \
 			--exec "$D_PATH/staticd" \
 			-- \
-			`eval echo "$"staticd"_options"`
+			`eval echo "$"staticd"_options"` $frr_global_options
 	fi
 }
 
@@ -511,6 +505,18 @@ fi
 # Read configuration variable file if it is present
 [ -r /etc/default/frr ] && . /etc/default/frr
 
+if test -z "$frr_profile"; then
+	# try to autodetect config profile
+	if test -d /etc/cumulus; then
+		frr_profile=datacenter
+	# elif test ...; then
+	# -- add your distro/system here
+	elif test -n "$FRR_DEFAULT_PROFILE"; then
+		frr_profile="$FRR_DEFAULT_PROFILE"
+	fi
+fi
+test -n "$frr_profile" && frr_global_options="$frr_global_options -F $frr_profile"
+
 MAX_INSTANCES=${MAX_INSTANCES:=5}
 
 # Set priority of un-startable daemons to 'no' and substitute 'yes' to '0'
@@ -518,9 +524,8 @@ convert_daemon_prios
 
 if [ ! -d $V_PATH ]; then
 	echo "Creating $V_PATH"
-	mkdir -p $V_PATH
-	chownfrr $V_PATH
-	chmod 755 /$V_PATH
+	install -g "$FRR_GROUP" -o "$FRR_USER" -m "$FRR_CONFIG_MODE" -d "$V_PATH"
+	chmod gu+x "${V_PATH}"
 fi
 
 if [ -n "$3" ] && [ "$3" != "all" ]; then
@@ -561,30 +566,7 @@ case "$1" in
 			stop_prio 0 $dmn
 		fi
 
-		if [ -z "$dmn" -o "$dmn" = "zebra" ]; then
-			echo "Removing all routes made by FRR."
-			# Specific values for each proto can be found
-			# in /etc/iproute2/rt_protos as well as FRR
-			# specific ones in /etc/iproute2/rt_protos.d
-			# Additionally if a new protocol is added
-			# we need to add it here as well as
-			# in rt_netlink.h( follow the directions! )
-			ip route flush proto 4
-			ip route flush proto 11
-			ip route flush proto 42
-			ip route flush proto 186
-			ip route flush proto 187
-			ip route flush proto 188
-			ip route flush proto 189
-			ip route flush proto 190
-			ip route flush proto 191
-			ip route flush proto 192
-			ip route flush proto 193
-			ip route flush proto 194
-			ip route flush proto 195
-			ip route flush proto 196
-			ip route flush proto 197
-		else
+		if [ -n "$dmn" -a "$dmn" != "zebra" ]; then
 			[ -n "$dmn" ] && eval "${dmn/-/_}=0"
 			start_watchfrr
 		fi

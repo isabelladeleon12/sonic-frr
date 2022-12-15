@@ -34,6 +34,7 @@
 #include "stream.h"
 #include "log.h"
 #include "memory.h"
+#include "xref.h"
 
 /* work around gcc bug 69981, disable MTYPEs in libospf */
 #define _QUAGGA_OSPF_MEMORY_H
@@ -49,6 +50,7 @@
 #include "ospfd/ospf_route.h"
 #include "ospfd/ospf_zebra.h"
 #include "ospfd/ospf_api.h"
+#include "ospfd/ospf_errors.h"
 
 #include "ospf_apiclient.h"
 
@@ -56,8 +58,10 @@
 #include "ospfd/ospf_dump_api.c"
 #include "ospfd/ospf_api.c"
 
-DEFINE_MGROUP(OSPFCLIENT, "libospfapiclient")
-DEFINE_MTYPE_STATIC(OSPFCLIENT, OSPF_APICLIENT, "OSPF-API client")
+XREF_SETUP();
+
+DEFINE_MGROUP(OSPFCLIENT, "libospfapiclient");
+DEFINE_MTYPE_STATIC(OSPFCLIENT, OSPF_APICLIENT, "OSPF-API client");
 
 /* Backlog for listen */
 #define BACKLOG 5
@@ -87,7 +91,7 @@ static unsigned short ospf_apiclient_getport(void)
 }
 
 /* -----------------------------------------------------------
- * Followings are functions for connection management
+ * Following are functions for connection management
  * -----------------------------------------------------------
  */
 
@@ -120,7 +124,7 @@ struct ospf_apiclient *ospf_apiclient_connect(char *host, int syncport)
 
 	/* Prepare socket for asynchronous messages */
 	/* Initialize async address structure */
-	memset(&myaddr_async, 0, sizeof(struct sockaddr_in));
+	memset(&myaddr_async, 0, sizeof(myaddr_async));
 	myaddr_async.sin_family = AF_INET;
 	myaddr_async.sin_addr.s_addr = htonl(INADDR_ANY);
 	myaddr_async.sin_port = htons(syncport + 1);
@@ -215,7 +219,7 @@ struct ospf_apiclient *ospf_apiclient_connect(char *host, int syncport)
 	   want the sync port number on a fixed port number. The reverse
 	   async channel will be at this port+1 */
 
-	memset(&myaddr_sync, 0, sizeof(struct sockaddr_in));
+	memset(&myaddr_sync, 0, sizeof(myaddr_sync));
 	myaddr_sync.sin_family = AF_INET;
 	myaddr_sync.sin_port = htons(syncport);
 #ifdef HAVE_STRUCT_SOCKADDR_IN_SIN_LEN
@@ -296,7 +300,7 @@ int ospf_apiclient_close(struct ospf_apiclient *oclient)
 }
 
 /* -----------------------------------------------------------
- * Followings are functions to send a request to OSPFd
+ * Following are functions to send a request to OSPFd
  * -----------------------------------------------------------
  */
 
@@ -435,12 +439,24 @@ int ospf_apiclient_lsa_originate(struct ospf_apiclient *oclient,
 	struct lsa_header *lsah;
 	uint32_t tmp;
 
+	/* Validate opaque LSA length */
+	if ((size_t)opaquelen > sizeof(buf) - sizeof(struct lsa_header)) {
+		fprintf(stderr, "opaquelen(%d) is larger than buf size %zu\n",
+			opaquelen, sizeof(buf));
+		return OSPF_API_NOMEMORY;
+	}
 
 	/* We can only originate opaque LSAs */
 	if (!IS_OPAQUE_LSA(lsa_type)) {
 		fprintf(stderr, "Cannot originate non-opaque LSA type %d\n",
 			lsa_type);
 		return OSPF_API_ILLEGALLSATYPE;
+	}
+
+	if ((size_t)opaquelen > sizeof(buf) - sizeof(struct lsa_header)) {
+		fprintf(stderr, "opaquelen(%d) is larger than buf size %zu\n",
+			opaquelen, sizeof(buf));
+		return OSPF_API_NOMEMORY;
 	}
 
 	/* Make a new LSA from parameters */
@@ -451,7 +467,7 @@ int ospf_apiclient_lsa_originate(struct ospf_apiclient *oclient,
 
 	tmp = SET_OPAQUE_LSID(opaque_type, opaque_id);
 	lsah->id.s_addr = htonl(tmp);
-	lsah->adv_router.s_addr = 0;
+	lsah->adv_router.s_addr = INADDR_ANY;
 	lsah->ls_seqnum = 0;
 	lsah->checksum = 0;
 	lsah->length = htons(sizeof(struct lsa_header) + opaquelen);
@@ -471,8 +487,9 @@ int ospf_apiclient_lsa_originate(struct ospf_apiclient *oclient,
 }
 
 int ospf_apiclient_lsa_delete(struct ospf_apiclient *oclient,
-			      struct in_addr area_id, uint8_t lsa_type,
-			      uint8_t opaque_type, uint32_t opaque_id)
+			      struct in_addr addr, uint8_t lsa_type,
+			      uint8_t opaque_type, uint32_t opaque_id,
+			      uint8_t flags)
 {
 	struct msg *msg;
 	int rc;
@@ -486,15 +503,15 @@ int ospf_apiclient_lsa_delete(struct ospf_apiclient *oclient,
 
 	/* opaque_id is in host byte order and will be converted
 	 * to network byte order by new_msg_delete_request */
-	msg = new_msg_delete_request(ospf_apiclient_get_seqnr(), area_id,
-				     lsa_type, opaque_type, opaque_id);
+	msg = new_msg_delete_request(ospf_apiclient_get_seqnr(), addr, lsa_type,
+				     opaque_type, opaque_id, flags);
 
 	rc = ospf_apiclient_send_request(oclient, msg);
 	return rc;
 }
 
 /* -----------------------------------------------------------
- * Followings are handlers for messages from OSPF daemon
+ * Following are handlers for messages from OSPF daemon
  * -----------------------------------------------------------
  */
 
@@ -564,15 +581,25 @@ static void ospf_apiclient_handle_lsa_update(struct ospf_apiclient *oclient,
 {
 	struct msg_lsa_change_notify *cn;
 	struct lsa_header *lsa;
-	int lsalen;
+	void *p;
+	uint16_t lsalen;
 
 	cn = (struct msg_lsa_change_notify *)STREAM_DATA(msg->s);
 
 	/* Extract LSA from message */
 	lsalen = ntohs(cn->data.length);
-	lsa = XMALLOC(MTYPE_OSPF_APICLIENT, lsalen);
+	if (lsalen > OSPF_MAX_LSA_SIZE) {
+		flog_warn(
+			EC_OSPF_LARGE_LSA,
+			"%s: message received size: %d is greater than a LSA size: %d",
+			__func__, lsalen, OSPF_MAX_LSA_SIZE);
+		return;
+	}
 
-	memcpy(lsa, &(cn->data), lsalen);
+	p = XMALLOC(MTYPE_OSPF_APICLIENT, lsalen);
+
+	memcpy(p, &(cn->data), lsalen);
+	lsa = p;
 
 	/* Invoke registered update callback function */
 	if (oclient->update_notify) {
@@ -581,7 +608,7 @@ static void ospf_apiclient_handle_lsa_update(struct ospf_apiclient *oclient,
 	}
 
 	/* free memory allocated by ospf apiclient library */
-	XFREE(MTYPE_OSPF_APICLIENT, lsa);
+	XFREE(MTYPE_OSPF_APICLIENT, p);
 }
 
 static void ospf_apiclient_handle_lsa_delete(struct ospf_apiclient *oclient,
@@ -589,15 +616,25 @@ static void ospf_apiclient_handle_lsa_delete(struct ospf_apiclient *oclient,
 {
 	struct msg_lsa_change_notify *cn;
 	struct lsa_header *lsa;
-	int lsalen;
+	void *p;
+	uint16_t lsalen;
 
 	cn = (struct msg_lsa_change_notify *)STREAM_DATA(msg->s);
 
 	/* Extract LSA from message */
 	lsalen = ntohs(cn->data.length);
-	lsa = XMALLOC(MTYPE_OSPF_APICLIENT, lsalen);
+	if (lsalen > OSPF_MAX_LSA_SIZE) {
+		flog_warn(
+			EC_OSPF_LARGE_LSA,
+			"%s: message received size: %d is greater than a LSA size: %d",
+			__func__, lsalen, OSPF_MAX_LSA_SIZE);
+		return;
+	}
 
-	memcpy(lsa, &(cn->data), lsalen);
+	p = XMALLOC(MTYPE_OSPF_APICLIENT, lsalen);
+
+	memcpy(p, &(cn->data), lsalen);
+	lsa = p;
 
 	/* Invoke registered update callback function */
 	if (oclient->delete_notify) {
@@ -606,7 +643,7 @@ static void ospf_apiclient_handle_lsa_delete(struct ospf_apiclient *oclient,
 	}
 
 	/* free memory allocated by ospf apiclient library */
-	XFREE(MTYPE_OSPF_APICLIENT, lsa);
+	XFREE(MTYPE_OSPF_APICLIENT, p);
 }
 
 static void ospf_apiclient_msghandle(struct ospf_apiclient *oclient,

@@ -60,7 +60,7 @@ struct vici_message_ctx {
 	int nsections;
 };
 
-static int vici_reconnect(struct thread *t);
+static void vici_reconnect(struct thread *t);
 static void vici_submit_request(struct vici_conn *vici, const char *name, ...);
 
 static void vici_zbuf_puts(struct zbuf *obuf, const char *str)
@@ -200,6 +200,7 @@ static void parse_sa_message(struct vici_message_ctx *ctx,
 						nhrp_vc_ipsec_updown(
 							sactx->child_uniqueid,
 							vc);
+					vc->ike_uniqueid = sactx->ike_uniqueid;
 				}
 			} else {
 				nhrp_vc_ipsec_updown(sactx->child_uniqueid, 0);
@@ -207,7 +208,7 @@ static void parse_sa_message(struct vici_message_ctx *ctx,
 		}
 		break;
 	default:
-		if (!key)
+		if (!key || !key->ptr)
 			break;
 
 		switch (key->ptr[0]) {
@@ -303,7 +304,7 @@ static void vici_recv_sa(struct vici_conn *vici, struct zbuf *msg, int event)
 	if (ctx.kill_ikesa && ctx.ike_uniqueid) {
 		debugf(NHRP_DEBUG_COMMON, "VICI: Deleting IKE_SA %u",
 		       ctx.ike_uniqueid);
-		snprintf(buf, sizeof buf, "%u", ctx.ike_uniqueid);
+		snprintf(buf, sizeof(buf), "%u", ctx.ike_uniqueid);
 		vici_submit_request(vici, "terminate", VICI_KEY_VALUE, "ike-id",
 				    strlen(buf), buf, VICI_END);
 	}
@@ -354,16 +355,15 @@ static void vici_recv_message(struct vici_conn *vici, struct zbuf *msg)
 	}
 }
 
-static int vici_read(struct thread *t)
+static void vici_read(struct thread *t)
 {
 	struct vici_conn *vici = THREAD_ARG(t);
 	struct zbuf *ibuf = &vici->ibuf;
 	struct zbuf pktbuf;
 
-	vici->t_read = NULL;
 	if (zbuf_read(ibuf, vici->fd, (size_t)-1) < 0) {
 		vici_connection_error(vici);
-		return 0;
+		return;
 	}
 
 	/* Process all messages in buffer */
@@ -383,15 +383,13 @@ static int vici_read(struct thread *t)
 	} while (1);
 
 	thread_add_read(master, vici_read, vici, vici->fd, &vici->t_read);
-	return 0;
 }
 
-static int vici_write(struct thread *t)
+static void vici_write(struct thread *t)
 {
 	struct vici_conn *vici = THREAD_ARG(t);
 	int r;
 
-	vici->t_write = NULL;
 	r = zbufq_write(&vici->obuf, vici->fd);
 	if (r > 0) {
 		thread_add_write(master, vici_write, vici, vici->fd,
@@ -399,8 +397,6 @@ static int vici_write(struct thread *t)
 	} else if (r < 0) {
 		vici_connection_error(vici);
 	}
-
-	return 0;
 }
 
 static void vici_submit(struct vici_conn *vici, struct zbuf *obuf)
@@ -469,23 +465,61 @@ static void vici_register_event(struct vici_conn *vici, const char *name)
 	vici_submit(vici, obuf);
 }
 
-static int vici_reconnect(struct thread *t)
+static bool vici_charon_filepath_done;
+static bool vici_charon_not_found;
+
+static char *vici_get_charon_filepath(void)
+{
+	static char buff[1200];
+	FILE *fp;
+	char *ptr;
+	char line[1024];
+
+	if (vici_charon_filepath_done)
+		return (char *)buff;
+	fp = popen("ipsec --piddir", "r");
+	if (!fp) {
+		if (!vici_charon_not_found) {
+			flog_err(EC_NHRP_SWAN,
+				 "VICI: Failed to retrieve charon file path");
+			vici_charon_not_found = true;
+		}
+		return NULL;
+	}
+	/* last line of output is used to get vici path */
+	while (fgets(line, sizeof(line), fp) != NULL) {
+		ptr = strchr(line, '\n');
+		if (ptr)
+			*ptr = '\0';
+		snprintf(buff, sizeof(buff), "%s/charon.vici", line);
+	}
+	pclose(fp);
+	vici_charon_filepath_done = true;
+	return buff;
+}
+
+static void vici_reconnect(struct thread *t)
 {
 	struct vici_conn *vici = THREAD_ARG(t);
 	int fd;
+	char *file_path;
 
-	vici->t_reconnect = NULL;
 	if (vici->fd >= 0)
-		return 0;
+		return;
 
-	fd = sock_open_unix("/var/run/charon.vici");
+	fd = sock_open_unix(VICI_SOCKET);
+	if (fd < 0) {
+		file_path = vici_get_charon_filepath();
+		if (file_path)
+			fd = sock_open_unix(file_path);
+	}
 	if (fd < 0) {
 		debugf(NHRP_DEBUG_VICI,
-		       "%s: failure connecting VICI socket: %s",
-		       __PRETTY_FUNCTION__, strerror(errno));
+		       "%s: failure connecting VICI socket: %s", __func__,
+		       strerror(errno));
 		thread_add_timer(master, vici_reconnect, vici, 2,
 				 &vici->t_reconnect);
-		return 0;
+		return;
 	}
 
 	debugf(NHRP_DEBUG_COMMON, "VICI: Connected");
@@ -500,8 +534,6 @@ static int vici_reconnect(struct thread *t)
 	vici_register_event(vici, "child-state-destroying");
 	vici_register_event(vici, "list-sa");
 	vici_submit_request(vici, "list-sas", VICI_END);
-
-	return 0;
 }
 
 static struct vici_conn vici_connection;
@@ -521,14 +553,34 @@ void vici_terminate(void)
 {
 }
 
+void vici_terminate_vc_by_profile_name(char *profile_name)
+{
+	struct vici_conn *vici = &vici_connection;
+
+	debugf(NHRP_DEBUG_VICI, "Terminate profile = %s", profile_name);
+	vici_submit_request(vici, "terminate", VICI_KEY_VALUE, "ike",
+		    strlen(profile_name), profile_name, VICI_END);
+}
+
+void vici_terminate_vc_by_ike_id(unsigned int ike_id)
+{
+	struct vici_conn *vici = &vici_connection;
+	char ike_id_str[10];
+
+	snprintf(ike_id_str, sizeof(ike_id_str), "%d", ike_id);
+	debugf(NHRP_DEBUG_VICI, "Terminate ike_id_str = %s", ike_id_str);
+	vici_submit_request(vici, "terminate", VICI_KEY_VALUE, "ike-id",
+		    strlen(ike_id_str), ike_id_str, VICI_END);
+}
+
 void vici_request_vc(const char *profile, union sockunion *src,
 		     union sockunion *dst, int prio)
 {
 	struct vici_conn *vici = &vici_connection;
 	char buf[2][SU_ADDRSTRLEN];
 
-	sockunion2str(src, buf[0], sizeof buf[0]);
-	sockunion2str(dst, buf[1], sizeof buf[1]);
+	sockunion2str(src, buf[0], sizeof(buf[0]));
+	sockunion2str(dst, buf[1], sizeof(buf[1]));
 
 	vici_submit_request(vici, "initiate", VICI_KEY_VALUE, "child",
 			    strlen(profile), profile, VICI_KEY_VALUE, "timeout",
@@ -548,9 +600,9 @@ int sock_open_unix(const char *path)
 	if (fd < 0)
 		return -1;
 
-	memset(&addr, 0, sizeof(struct sockaddr_un));
+	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+	strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
 
 	ret = connect(fd, (struct sockaddr *)&addr,
 		      sizeof(addr.sun_family) + strlen(addr.sun_path));

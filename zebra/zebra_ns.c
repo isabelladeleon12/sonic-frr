@@ -23,14 +23,11 @@
 
 #include "lib/ns.h"
 #include "lib/vrf.h"
-#include "lib/logicalrouter.h"
 #include "lib/prefix.h"
 #include "lib/memory.h"
 
-#include "rtadv.h"
 #include "zebra_ns.h"
 #include "zebra_vrf.h"
-#include "zebra_memory.h"
 #include "rt.h"
 #include "zebra_vxlan.h"
 #include "debug.h"
@@ -39,14 +36,14 @@
 #include "zebra_pbr.h"
 #include "rib.h"
 #include "table_manager.h"
+#include "zebra_errors.h"
 
 extern struct zebra_privs_t zserv_privs;
 
-DEFINE_MTYPE(ZEBRA, ZEBRA_NS, "Zebra Name Space")
+DEFINE_MTYPE_STATIC(ZEBRA, ZEBRA_NS, "Zebra Name Space");
 
 static struct zebra_ns *dzns;
 
-static int logicalrouter_config_write(struct vty *vty);
 static int zebra_ns_disable_internal(struct zebra_ns *zns, bool complete);
 
 struct zebra_ns *zebra_ns_lookup(ns_id_t ns_id)
@@ -66,6 +63,9 @@ static struct zebra_ns *zebra_ns_alloc(void)
 static int zebra_ns_new(struct ns *ns)
 {
 	struct zebra_ns *zns;
+
+	if (!ns)
+		return -1;
 
 	if (IS_ZEBRA_DEBUG_EVENT)
 		zlog_info("ZNS %s with id %u (created)", ns->name, ns->ns_id);
@@ -89,7 +89,7 @@ static int zebra_ns_delete(struct ns *ns)
 		zlog_info("ZNS %s with id %u (deleted)", ns->name, ns->ns_id);
 	if (!zns)
 		return 0;
-	XFREE(MTYPE_ZEBRA_NS, zns);
+	XFREE(MTYPE_ZEBRA_NS, ns->info);
 	return 0;
 }
 
@@ -122,16 +122,11 @@ int zebra_ns_enable(ns_id_t ns_id, void **info)
 
 	zns->ns_id = ns_id;
 
-#if defined(HAVE_RTADV)
-	rtadv_init(zns);
-#endif
-
 	kernel_init(zns);
+	zebra_dplane_ns_enable(zns, true);
 	interface_list(zns);
 	route_read(zns);
-
-	/* Initiate Table Manager per ZNS */
-	table_manager_enable(ns_id);
+	kernel_read_pbr_rules(zns);
 
 	return 0;
 }
@@ -142,13 +137,10 @@ int zebra_ns_enable(ns_id_t ns_id, void **info)
 static int zebra_ns_disable_internal(struct zebra_ns *zns, bool complete)
 {
 	route_table_finish(zns->if_table);
-#if defined(HAVE_RTADV)
-	rtadv_terminate(zns);
-#endif
+
+	zebra_dplane_ns_enable(zns, false /*Disable*/);
 
 	kernel_terminate(zns, complete);
-
-	table_manager_disable(zns->ns_id);
 
 	zns->ns_id = NS_DEFAULT;
 
@@ -158,20 +150,25 @@ static int zebra_ns_disable_internal(struct zebra_ns *zns, bool complete)
 /* During zebra shutdown, do partial cleanup while the async dataplane
  * is still running.
  */
-int zebra_ns_early_shutdown(struct ns *ns)
+int zebra_ns_early_shutdown(struct ns *ns,
+			    void *param_in __attribute__((unused)),
+			    void **param_out __attribute__((unused)))
 {
 	struct zebra_ns *zns = ns->info;
 
 	if (zns == NULL)
 		return 0;
 
-	return zebra_ns_disable_internal(zns, false);
+	zebra_ns_disable_internal(zns, false);
+	return NS_WALK_CONTINUE;
 }
 
 /* During zebra shutdown, do final cleanup
  * after all dataplane work is complete.
  */
-int zebra_ns_final_shutdown(struct ns *ns)
+int zebra_ns_final_shutdown(struct ns *ns,
+			    void *param_in __attribute__((unused)),
+			    void **param_out __attribute__((unused)))
 {
 	struct zebra_ns *zns = ns->info;
 
@@ -180,36 +177,41 @@ int zebra_ns_final_shutdown(struct ns *ns)
 
 	kernel_terminate(zns, true);
 
-	return 0;
+	return NS_WALK_CONTINUE;
 }
 
-int zebra_ns_init(const char *optional_default_name)
+int zebra_ns_init(void)
 {
+	struct ns *default_ns;
 	ns_id_t ns_id;
 	ns_id_t ns_id_external;
+	struct ns *ns;
 
-	dzns = zebra_ns_alloc();
-
-	frr_elevate_privs(&zserv_privs) {
+	frr_with_privs(&zserv_privs) {
 		ns_id = zebra_ns_id_get_default();
 	}
 	ns_id_external = ns_map_nsid_with_external(ns_id, true);
 	ns_init_management(ns_id_external, ns_id);
+	ns = ns_get_default();
+	if (ns)
+		ns->relative_default_ns = ns_id;
 
-	logicalrouter_init(logicalrouter_config_write);
+	default_ns = ns_lookup(NS_DEFAULT);
+	if (!default_ns) {
+		flog_err(EC_ZEBRA_NS_NO_DEFAULT,
+			 "%s: failed to find default ns", __func__);
+		exit(EXIT_FAILURE); /* This is non-recoverable */
+	}
 
 	/* Do any needed per-NS data structure allocation. */
-	dzns->if_table = route_table_init();
+	zebra_ns_new(default_ns);
+	dzns = default_ns->info;
 
 	/* Register zebra VRF callbacks, create and activate default VRF. */
 	zebra_vrf_init();
 
 	/* Default NS is activated */
 	zebra_ns_enable(ns_id_external, (void **)&dzns);
-
-	if (optional_default_name)
-		vrf_set_default_name(optional_default_name,
-				     true);
 
 	if (vrf_is_backend_netns()) {
 		ns_add_hook(NS_NEW_HOOK, zebra_ns_new);
@@ -221,21 +223,6 @@ int zebra_ns_init(const char *optional_default_name)
 	}
 
 	return 0;
-}
-
-static int logicalrouter_config_write(struct vty *vty)
-{
-	struct ns *ns;
-	int write = 0;
-
-	RB_FOREACH (ns, ns_head, &ns_tree) {
-		if (ns->ns_id == NS_DEFAULT || ns->name == NULL)
-			continue;
-		vty_out(vty, "logical-router %u netns %s\n", ns->ns_id,
-			ns->name);
-		write = 1;
-	}
-	return write;
 }
 
 int zebra_ns_config_write(struct vty *vty, struct ns *ns)

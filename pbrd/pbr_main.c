@@ -48,6 +48,7 @@
 #include "pbr_zebra.h"
 #include "pbr_vty.h"
 #include "pbr_debug.h"
+#include "pbr_vrf.h"
 
 zebra_capabilities_t _caps_p[] = {
 	ZCAP_NET_RAW, ZCAP_BIND, ZCAP_NET_ADMIN,
@@ -81,6 +82,10 @@ static void sigint(void)
 {
 	zlog_notice("Terminating on signal");
 
+	pbr_vrf_terminate();
+
+	frr_fini();
+
 	exit(0);
 }
 
@@ -90,7 +95,7 @@ static void sigusr1(void)
 	zlog_rotate();
 }
 
-struct quagga_signal_t pbr_signals[] = {
+struct frr_signal_t pbr_signals[] = {
 	{
 		.signal = SIGHUP,
 		.handler = &sighup,
@@ -111,8 +116,10 @@ struct quagga_signal_t pbr_signals[] = {
 
 #define PBR_VTY_PORT 2615
 
-static const struct frr_yang_module_info *pbrd_yang_modules[] = {
+static const struct frr_yang_module_info *const pbrd_yang_modules[] = {
+	&frr_filter_info,
 	&frr_interface_info,
+	&frr_vrf_info,
 };
 
 FRR_DAEMON_INFO(pbrd, PBR, .vty_port = PBR_VTY_PORT,
@@ -125,7 +132,8 @@ FRR_DAEMON_INFO(pbrd, PBR, .vty_port = PBR_VTY_PORT,
 		.privs = &pbr_privs,
 
 		.yang_modules = pbrd_yang_modules,
-		.n_yang_modules = array_size(pbrd_yang_modules), )
+		.n_yang_modules = array_size(pbrd_yang_modules),
+);
 
 int main(int argc, char **argv, char **envp)
 {
@@ -145,7 +153,6 @@ int main(int argc, char **argv, char **envp)
 			break;
 		default:
 			frr_help_exit(1);
-			break;
 		}
 	}
 
@@ -153,7 +160,6 @@ int main(int argc, char **argv, char **envp)
 
 	pbr_debug_init();
 
-	vrf_init(NULL, NULL, NULL, NULL, NULL);
 	nexthop_group_init(pbr_nhgroup_add_cb,
 			   pbr_nhgroup_add_nexthop_cb,
 			   pbr_nhgroup_del_nexthop_cb,
@@ -166,7 +172,10 @@ int main(int argc, char **argv, char **envp)
 	access_list_init();
 	pbr_nht_init();
 	pbr_map_init();
+	if_zapi_callbacks(pbr_ifp_create, pbr_ifp_up,
+			  pbr_ifp_down, pbr_ifp_destroy);
 	pbr_zebra_init();
+	pbr_vrf_init();
 	pbr_vty_init();
 
 	frr_config_fork();

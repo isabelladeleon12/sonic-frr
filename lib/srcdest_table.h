@@ -4,7 +4,7 @@
  * Copyright (C) 2017 by David Lamparter & Christian Franke,
  *                       Open Source Routing / NetDEF Inc.
  *
- * This file is part of FreeRangeRouting (FRR)
+ * This file is part of FRRouting (FRR)
  *
  * FRR is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -65,22 +65,22 @@ extern struct route_node *srcdest_rnode_get(struct route_table *table,
 extern struct route_node *srcdest_rnode_lookup(struct route_table *table,
 					       union prefixconstptr dst_pu,
 					       const struct prefix_ipv6 *src_p);
-extern void srcdest_rnode_prefixes(struct route_node *rn,
+extern void srcdest_rnode_prefixes(const struct route_node *rn,
 				   const struct prefix **p,
 				   const struct prefix **src_p);
 extern const char *srcdest2str(const struct prefix *dst_p,
 			       const struct prefix_ipv6 *src_p,
 			       char *str, int size);
-extern const char *srcdest_rnode2str(struct route_node *rn, char *str,
+extern const char *srcdest_rnode2str(const struct route_node *rn, char *str,
 				     int size);
 extern struct route_node *srcdest_route_next(struct route_node *rn);
 
-static inline int rnode_is_dstnode(struct route_node *rn)
+static inline int rnode_is_dstnode(const struct route_node *rn)
 {
 	return rn->table->delegate == &_srcdest_dstnode_delegate;
 }
 
-static inline int rnode_is_srcnode(struct route_node *rn)
+static inline int rnode_is_srcnode(const struct route_node *rn)
 {
 	return rn->table->delegate == &_srcdest_srcnode_delegate;
 }
@@ -99,6 +99,8 @@ static inline void *srcdest_rnode_table_info(struct route_node *rn)
 {
 	return route_table_get_info(srcdest_rnode_table(rn));
 }
+
+extern struct route_table *srcdest_srcnode_table(struct route_node *rn);
 
 #ifdef __cplusplus
 }

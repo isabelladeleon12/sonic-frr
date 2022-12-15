@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 #ifndef __LINUX_NEIGHBOUR_H
 #define __LINUX_NEIGHBOUR_H
 
@@ -27,6 +28,10 @@ enum {
 	NDA_MASTER,
 	NDA_LINK_NETNSID,
 	NDA_SRC_VNI,
+	NDA_PROTOCOL,  /* Originator of entry */
+	NDA_NH_ID,
+	NDA_FDB_EXT_ATTRS,
+	NDA_EXT_FLAGS,
 	__NDA_MAX
 };
 
@@ -42,7 +47,12 @@ enum {
 #define NTF_PROXY	0x08	/* == ATF_PUBL */
 #define NTF_EXT_LEARNED	0x10
 #define NTF_OFFLOADED   0x20
+#define NTF_STICKY	0x40
 #define NTF_ROUTER	0x80
+
+/* Neighbor Cache Entry extended flags, part of NDA_EXT_FLAGS attribute */
+#define NTF_E_WEAK_OVERRIDE_STATE 0x01
+#define NTF_E_MH_PEER_SYNC 0x02
 
 /*
  *	Neighbor Cache Entry States.
@@ -167,5 +177,28 @@ enum {
 	__NDTA_MAX
 };
 #define NDTA_MAX (__NDTA_MAX - 1)
+
+/* FDB activity notification bits used in NFEA_ACTIVITY_NOTIFY:
+ * - FDB_NOTIFY_BIT - notify on activity/expire for any entry
+ * - FDB_NOTIFY_INACTIVE_BIT - mark as inactive to avoid multiple notifications
+ */
+enum {
+	FDB_NOTIFY_BIT		= (1 << 0),
+	FDB_NOTIFY_INACTIVE_BIT	= (1 << 1)
+};
+
+/* embedded into NDA_FDB_EXT_ATTRS:
+ * [NDA_FDB_EXT_ATTRS] = {
+ *     [NFEA_ACTIVITY_NOTIFY]
+ *     ...
+ * }
+ */
+enum {
+	NFEA_UNSPEC,
+	NFEA_ACTIVITY_NOTIFY,
+	NFEA_DONT_REFRESH,
+	__NFEA_MAX
+};
+#define NFEA_MAX (__NFEA_MAX - 1)
 
 #endif

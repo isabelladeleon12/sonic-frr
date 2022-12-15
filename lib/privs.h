@@ -24,6 +24,7 @@
 #define _ZEBRA_PRIVS_H
 
 #include <pthread.h>
+#include <stdint.h>
 #include "lib/queue.h"
 
 #ifdef __cplusplus
@@ -43,6 +44,8 @@ typedef enum {
 	ZCAP_DAC_OVERRIDE,
 	ZCAP_READ_SEARCH,
 	ZCAP_FOWNER,
+	ZCAP_IPC_LOCK,
+	ZCAP_SYS_RAWIO,
 	ZCAP_MAX
 } zebra_capabilities_t;
 
@@ -99,6 +102,8 @@ struct zprivs_ids_t {
 	gid_t gid_vty;    /* vty gid */
 };
 
+extern struct zebra_privs_t *lib_privs;
+
 /* initialise zebra privileges */
 extern void zprivs_preinit(struct zebra_privs_t *zprivs);
 extern void zprivs_init(struct zebra_privs_t *zprivs);
@@ -109,16 +114,16 @@ extern void zprivs_get_ids(struct zprivs_ids_t *);
 
 /*
  * Wrapper around zprivs, to be used as:
- *   frr_elevate_privs(&privs) {
+ *   frr_with_privs(&privs) {
  *     ... code ...
  *     if (error)
  *       break;         -- break can be used to get out of the block
  *     ... code ...
  *   }
  *
- * The argument to frr_elevate_privs() can be NULL to leave privileges as-is
+ * The argument to frr_with_privs() can be NULL to leave privileges as-is
  * (mostly useful for conditional privilege-raising, i.e.:)
- *   frr_elevate_privs(cond ? &privs : NULL) {}
+ *   frr_with_privs(cond ? &privs : NULL) {}
  *
  * NB: The code block is always executed, regardless of whether privileges
  * could be raised or not, or whether NULL was given or not.  This is fully
@@ -138,7 +143,7 @@ extern struct zebra_privs_t *_zprivs_raise(struct zebra_privs_t *privs,
 					   const char *funcname);
 extern void _zprivs_lower(struct zebra_privs_t **privs);
 
-#define frr_elevate_privs(privs)                                               \
+#define frr_with_privs(privs)                                               \
 	for (struct zebra_privs_t *_once = NULL,                               \
 				  *_privs __attribute__(                       \
 					  (unused, cleanup(_zprivs_lower))) =  \

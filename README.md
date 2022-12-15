@@ -1,9 +1,13 @@
+<p align="center">
+<img src="http://docs.frrouting.org/en/latest/_static/frr-icon.svg" alt="Icon" width="20%"/>
+</p>
+
 FRRouting
 =========
 
 FRR is free software that implements and manages various IPv4 and IPv6 routing
-protocols. It runs on nearly all distributions of Linux and BSD as well as
-Solaris and supports all modern CPU architectures.
+protocols. It runs on nearly all distributions of Linux and BSD and
+supports all modern CPU architectures.
 
 FRR currently supports the following protocols:
 
@@ -20,20 +24,22 @@ FRR currently supports the following protocols:
 * Babel
 * PBR
 * OpenFabric
+* VRRP
 * EIGRP (alpha)
 * NHRP (alpha)
 
 Installation & Use
 ------------------
 
-Packages are available for various distributions on our
+For source tarballs, see the
 [releases page](https://github.com/FRRouting/frr/releases).
 
-Snaps are also available [here](https://snapcraft.io/frr).
+For Debian and its derivatives, use the APT repository at
+[https://deb.frrouting.org/](https://deb.frrouting.org/).
 
 Instructions on building and installing from source for supported platforms may
-be found
-[here](http://docs.frrouting.org/projects/dev-guide/en/latest/building.html).
+be found in the
+[developer docs](http://docs.frrouting.org/projects/dev-guide/en/latest/building.html).
 
 Once installed, please refer to the [user guide](http://docs.frrouting.org/)
 for instructions on use.
@@ -53,7 +59,7 @@ lists:
 
 For chat, we currently use [Slack](https://frrouting.slack.com). You can join
 by clicking the "Slack" link under the
-[Participate](https://frrouting.org/#participate) section of our website.
+[Participate](https://frrouting.org/community) section of our website.
 
 
 Contributing

@@ -49,20 +49,12 @@
 #include "isisd/isis_spf.h"
 #include "isisd/isis_errors.h"
 
-/* debug isis-spf spf-events
- 4w4d: ISIS-Spf (tlt): L2 SPF needed, new adjacency, from 0x609229F4
- 4w4d: ISIS-Spf (tlt): L2, 0000.0000.0042.01-00 TLV contents changed, code 0x2
- 4w4d: ISIS-Spf (tlt): L2, new LSP 0 DEAD.BEEF.0043.00-00
- 4w5d: ISIS-Spf (tlt): L1 SPF needed, periodic SPF, from 0x6091C844
- 4w5d: ISIS-Spf (tlt): L2 SPF needed, periodic SPF, from 0x6091C844
-*/
-
 void isis_event_circuit_state_change(struct isis_circuit *circuit,
 				     struct isis_area *area, int up)
 {
 	area->circuit_state_changes++;
 
-	if (isis->debugs & DEBUG_EVENTS)
+	if (IS_DEBUG_EVENTS)
 		zlog_debug("ISIS-Evt (%s) circuit %s", area->area_tag,
 			   up ? "up" : "down");
 
@@ -76,6 +68,12 @@ void isis_event_circuit_state_change(struct isis_circuit *circuit,
 
 static void circuit_commence_level(struct isis_circuit *circuit, int level)
 {
+	if (IS_DEBUG_EVENTS)
+		zlog_debug(
+			"ISIS-Evt (%s) circuit %u on iface %s commencing on L%d",
+			circuit->area->area_tag, circuit->circuit_id,
+			circuit->interface->name, level);
+
 	if (!circuit->is_passive) {
 		if (level == 1) {
 			thread_add_timer(master, send_l1_psnp, circuit,
@@ -105,15 +103,22 @@ static void circuit_resign_level(struct isis_circuit *circuit, int level)
 {
 	int idx = level - 1;
 
-	THREAD_TIMER_OFF(circuit->t_send_csnp[idx]);
-	THREAD_TIMER_OFF(circuit->t_send_psnp[idx]);
+	if (IS_DEBUG_EVENTS)
+		zlog_debug(
+			"ISIS-Evt (%s) circuit %u on iface %s resigning on L%d",
+			circuit->area->area_tag, circuit->circuit_id,
+			circuit->interface->name, level);
+
+	THREAD_OFF(circuit->t_send_csnp[idx]);
+	THREAD_OFF(circuit->t_send_psnp[idx]);
 
 	if (circuit->circ_type == CIRCUIT_T_BROADCAST) {
-		THREAD_TIMER_OFF(circuit->u.bc.t_send_lan_hello[idx]);
-		THREAD_TIMER_OFF(circuit->u.bc.t_run_dr[idx]);
-		THREAD_TIMER_OFF(circuit->u.bc.t_refresh_pseudo_lsp[idx]);
+		THREAD_OFF(circuit->u.bc.t_send_lan_hello[idx]);
+		THREAD_OFF(circuit->u.bc.t_run_dr[idx]);
+		THREAD_OFF(circuit->u.bc.t_refresh_pseudo_lsp[idx]);
 		circuit->lsp_regenerate_pending[idx] = 0;
 		circuit->u.bc.run_dr_elect[idx] = 0;
+		circuit->u.bc.is_dr[idx] = 0;
 		if (circuit->u.bc.lan_neighs[idx] != NULL)
 			list_delete(&circuit->u.bc.lan_neighs[idx]);
 	}
@@ -123,12 +128,12 @@ static void circuit_resign_level(struct isis_circuit *circuit, int level)
 
 void isis_circuit_is_type_set(struct isis_circuit *circuit, int newtype)
 {
-	if (circuit->state != C_STATE_UP) {
+	if (!circuit->area) {
 		circuit->is_type = newtype;
 		return;
 	}
 
-	if (isis->debugs & DEBUG_EVENTS)
+	if (IS_DEBUG_EVENTS)
 		zlog_debug("ISIS-Evt (%s) circuit type change %s -> %s",
 			   circuit->area->area_tag,
 			   circuit_t2string(circuit->is_type),
@@ -143,6 +148,11 @@ void isis_circuit_is_type_set(struct isis_circuit *circuit, int newtype)
 			"ISIS-Evt (%s) circuit type change - invalid level %s because area is %s",
 			circuit->area->area_tag, circuit_t2string(newtype),
 			circuit_t2string(circuit->area->is_type));
+		return;
+	}
+
+	if (circuit->state != C_STATE_UP) {
+		circuit->is_type = newtype;
 		return;
 	}
 
@@ -199,7 +209,7 @@ void isis_circuit_is_type_set(struct isis_circuit *circuit, int newtype)
 
 /* events supporting code */
 
-int isis_event_dis_status_change(struct thread *thread)
+void isis_event_dis_status_change(struct thread *thread)
 {
 	struct isis_circuit *circuit;
 
@@ -207,21 +217,19 @@ int isis_event_dis_status_change(struct thread *thread)
 
 	/* invalid arguments */
 	if (!circuit || !circuit->area)
-		return 0;
-	if (isis->debugs & DEBUG_EVENTS)
+		return;
+	if (IS_DEBUG_EVENTS)
 		zlog_debug("ISIS-Evt (%s) DIS status change",
 			   circuit->area->area_tag);
 
 	/* LSP generation again */
 	lsp_regenerate_schedule(circuit->area, IS_LEVEL_1 | IS_LEVEL_2, 0);
-
-	return 0;
 }
 
 void isis_event_auth_failure(char *area_tag, const char *error_string,
 			     uint8_t *sysid)
 {
-	if (isis->debugs & DEBUG_EVENTS)
+	if (IS_DEBUG_EVENTS)
 		zlog_debug("ISIS-Evt (%s) Authentication failure %s from %s",
 			   area_tag, error_string, sysid_print(sysid));
 

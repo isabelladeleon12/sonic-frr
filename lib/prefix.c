@@ -21,408 +21,24 @@
 
 #include <zebra.h>
 
+#include "command.h"
 #include "prefix.h"
+#include "ipaddr.h"
 #include "vty.h"
 #include "sockunion.h"
 #include "memory.h"
 #include "log.h"
 #include "jhash.h"
 #include "lib_errors.h"
+#include "printfrr.h"
+#include "vxlan.h"
 
-DEFINE_MTYPE_STATIC(LIB, PREFIX, "Prefix")
-DEFINE_MTYPE_STATIC(LIB, PREFIX_FLOWSPEC, "Prefix Flowspec")
+DEFINE_MTYPE_STATIC(LIB, PREFIX, "Prefix");
+DEFINE_MTYPE_STATIC(LIB, PREFIX_FLOWSPEC, "Prefix Flowspec");
 
 /* Maskbit. */
 static const uint8_t maskbit[] = {0x00, 0x80, 0xc0, 0xe0, 0xf0,
 				  0xf8, 0xfc, 0xfe, 0xff};
-
-static const struct in6_addr maskbytes6[] = {
-	/* /0   */ {{{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /1   */
-	{{{0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /2   */
-	{{{0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /3   */
-	{{{0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /4   */
-	{{{0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /5   */
-	{{{0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /6   */
-	{{{0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /7   */
-	{{{0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /8   */
-	{{{0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /9   */
-	{{{0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /10  */
-	{{{0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /11  */
-	{{{0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /12  */
-	{{{0xff, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /13  */
-	{{{0xff, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /14  */
-	{{{0xff, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /15  */
-	{{{0xff, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /16  */
-	{{{0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /17  */
-	{{{0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /18  */
-	{{{0xff, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /19  */
-	{{{0xff, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /20  */
-	{{{0xff, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /21  */
-	{{{0xff, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /22  */
-	{{{0xff, 0xff, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /23  */
-	{{{0xff, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /24  */
-	{{{0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /25  */
-	{{{0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /26  */
-	{{{0xff, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /27  */
-	{{{0xff, 0xff, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /28  */
-	{{{0xff, 0xff, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /29  */
-	{{{0xff, 0xff, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /30  */
-	{{{0xff, 0xff, 0xff, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /31  */
-	{{{0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /32  */
-	{{{0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /33  */
-	{{{0xff, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /34  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /35  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /36  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /37  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /38  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /39  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /40  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /41  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /42  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /43  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /44  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /45  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /46  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /47  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /48  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /49  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /50  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /51  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /52  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /53  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /54  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /55  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /56  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /57  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /58  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /59  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /60  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /61  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /62  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /63  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /64  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /65  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /66  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /67  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /68  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /69  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /70  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /71  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /72  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /73  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /74  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /75  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /76  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /77  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /78  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /79  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /80  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /81  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /82  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /83  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /84  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /85  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /86  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /87  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /88  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0x00, 0x00, 0x00, 0x00, 0x00}}},
-	/* /89  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0x80, 0x00, 0x00, 0x00, 0x00}}},
-	/* /90  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xc0, 0x00, 0x00, 0x00, 0x00}}},
-	/* /91  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xe0, 0x00, 0x00, 0x00, 0x00}}},
-	/* /92  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xf0, 0x00, 0x00, 0x00, 0x00}}},
-	/* /93  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xf8, 0x00, 0x00, 0x00, 0x00}}},
-	/* /94  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xfc, 0x00, 0x00, 0x00, 0x00}}},
-	/* /95  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xfe, 0x00, 0x00, 0x00, 0x00}}},
-	/* /96  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0x00, 0x00, 0x00, 0x00}}},
-	/* /97  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0x80, 0x00, 0x00, 0x00}}},
-	/* /98  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xc0, 0x00, 0x00, 0x00}}},
-	/* /99  */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xe0, 0x00, 0x00, 0x00}}},
-	/* /100 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xf0, 0x00, 0x00, 0x00}}},
-	/* /101 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xf8, 0x00, 0x00, 0x00}}},
-	/* /102 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xfc, 0x00, 0x00, 0x00}}},
-	/* /103 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xfe, 0x00, 0x00, 0x00}}},
-	/* /104 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0x00, 0x00, 0x00}}},
-	/* /105 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0x80, 0x00, 0x00}}},
-	/* /106 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xc0, 0x00, 0x00}}},
-	/* /107 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xe0, 0x00, 0x00}}},
-	/* /108 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xf0, 0x00, 0x00}}},
-	/* /109 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xf8, 0x00, 0x00}}},
-	/* /110 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xfc, 0x00, 0x00}}},
-	/* /111 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xfe, 0x00, 0x00}}},
-	/* /112 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0x00, 0x00}}},
-	/* /113 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0x80, 0x00}}},
-	/* /114 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xc0, 0x00}}},
-	/* /115 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xe0, 0x00}}},
-	/* /116 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xf0, 0x00}}},
-	/* /117 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xf8, 0x00}}},
-	/* /118 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xfc, 0x00}}},
-	/* /119 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xfe, 0x00}}},
-	/* /120 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xff, 0x00}}},
-	/* /121 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xff, 0x80}}},
-	/* /122 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xff, 0xc0}}},
-	/* /123 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xff, 0xe0}}},
-	/* /124 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xff, 0xf0}}},
-	/* /125 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xff, 0xf8}}},
-	/* /126 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xff, 0xfc}}},
-	/* /127 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xff, 0xfe}}},
-	/* /128 */
-	{{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	   0xff, 0xff, 0xff, 0xff, 0xff}}}};
 
 /* Number of bits in prefix type. */
 #ifndef PNBBY
@@ -431,16 +47,7 @@ static const struct in6_addr maskbytes6[] = {
 
 #define MASKBIT(offset)  ((0xff << (PNBBY - (offset))) & 0xff)
 
-void prefix_hexdump(const struct prefix *p)
-{
-	char buf[PREFIX_STRLEN];
-
-	zlog_debug("prefix: %s",
-		   prefix2str(p, buf, sizeof(buf)));
-	zlog_hexdump(p, sizeof(struct prefix));
-}
-
-int is_zero_mac(struct ethaddr *mac)
+int is_zero_mac(const struct ethaddr *mac)
 {
 	int i = 0;
 
@@ -452,17 +59,31 @@ int is_zero_mac(struct ethaddr *mac)
 	return 1;
 }
 
-unsigned int prefix_bit(const uint8_t *prefix, const uint16_t prefixlen)
+bool is_bcast_mac(const struct ethaddr *mac)
 {
-	unsigned int offset = prefixlen / 8;
-	unsigned int shift = 7 - (prefixlen % 8);
+	int i = 0;
 
-	return (prefix[offset] >> shift) & 1;
+	for (i = 0; i < ETH_ALEN; i++)
+		if (mac->octet[i] != 0xFF)
+			return false;
+
+	return true;
 }
 
-unsigned int prefix6_bit(const struct in6_addr *prefix, const uint16_t prefixlen)
+bool is_mcast_mac(const struct ethaddr *mac)
 {
-	return prefix_bit((const uint8_t *)&prefix->s6_addr, prefixlen);
+	if ((mac->octet[0] & 0x01) == 0x01)
+		return true;
+
+	return false;
+}
+
+unsigned int prefix_bit(const uint8_t *prefix, const uint16_t bit_index)
+{
+	unsigned int offset = bit_index / 8;
+	unsigned int shift = 7 - (bit_index % 8);
+
+	return (prefix[offset] >> shift) & 1;
 }
 
 int str2family(const char *string)
@@ -493,7 +114,7 @@ const char *family2str(int family)
 	return "?";
 }
 
-/* Address Famiy Identifier to Address Family converter. */
+/* Address Family Identifier to Address Family converter. */
 int afi2family(afi_t afi)
 {
 	if (afi == AFI_IP)
@@ -557,8 +178,10 @@ const char *safi2str(safi_t safi)
 }
 
 /* If n includes p prefix then return 1 else return 0. */
-int prefix_match(const struct prefix *n, const struct prefix *p)
+int prefix_match(union prefixconstptr unet, union prefixconstptr upfx)
 {
+	const struct prefix *n = unet.p;
+	const struct prefix *p = upfx.p;
 	int offset;
 	int shift;
 	const uint8_t *np, *pp;
@@ -569,6 +192,10 @@ int prefix_match(const struct prefix *n, const struct prefix *p)
 
 	if (n->family == AF_FLOWSPEC) {
 		/* prefixlen is unused. look at fs prefix len */
+		if (n->u.prefix_flowspec.family !=
+		    p->u.prefix_flowspec.family)
+			return 0;
+
 		if (n->u.prefix_flowspec.prefixlen >
 		    p->u.prefix_flowspec.prefixlen)
 			return 0;
@@ -600,12 +227,61 @@ int prefix_match(const struct prefix *n, const struct prefix *p)
 		if (np[offset] != pp[offset])
 			return 0;
 	return 1;
+
+}
+
+/*
+ * n is a type5 evpn prefix. This function tries to see if there is an
+ * ip-prefix within n which matches prefix p
+ * If n includes p prefix then return 1 else return 0.
+ */
+int evpn_type5_prefix_match(const struct prefix *n, const struct prefix *p)
+{
+	int offset;
+	int shift;
+	int prefixlen;
+	const uint8_t *np, *pp;
+	struct prefix_evpn *evp;
+
+	if (n->family != AF_EVPN)
+		return 0;
+
+	evp = (struct prefix_evpn *)n;
+	pp = p->u.val;
+
+	if ((evp->prefix.route_type != 5) ||
+	    (p->family == AF_INET6 && !is_evpn_prefix_ipaddr_v6(evp)) ||
+	    (p->family == AF_INET && !is_evpn_prefix_ipaddr_v4(evp)) ||
+	    (is_evpn_prefix_ipaddr_none(evp)))
+		return 0;
+
+	prefixlen = evp->prefix.prefix_addr.ip_prefix_length;
+	np = &evp->prefix.prefix_addr.ip.ip.addr;
+
+	/* If n's prefix is longer than p's one return 0. */
+	if (prefixlen > p->prefixlen)
+		return 0;
+
+	offset = prefixlen / PNBBY;
+	shift = prefixlen % PNBBY;
+
+	if (shift)
+		if (maskbit[shift] & (np[offset] ^ pp[offset]))
+			return 0;
+
+	while (offset--)
+		if (np[offset] != pp[offset])
+			return 0;
+	return 1;
+
 }
 
 /* If n includes p then return 1 else return 0. Prefix mask is not considered */
-int prefix_match_network_statement(const struct prefix *n,
-				   const struct prefix *p)
+int prefix_match_network_statement(union prefixconstptr unet,
+				   union prefixconstptr upfx)
 {
+	const struct prefix *n = unet.p;
+	const struct prefix *p = upfx.p;
 	int offset;
 	int shift;
 	const uint8_t *np, *pp;
@@ -627,8 +303,15 @@ int prefix_match_network_statement(const struct prefix *n,
 	return 1;
 }
 
-void prefix_copy(struct prefix *dest, const struct prefix *src)
+#ifdef __clang_analyzer__
+#undef prefix_copy	/* cf. prefix.h */
+#endif
+
+void prefix_copy(union prefixptr udest, union prefixconstptr usrc)
 {
+	struct prefix *dest = udest.p;
+	const struct prefix *src = usrc.p;
+
 	dest->family = src->family;
 	dest->prefixlen = src->prefixlen;
 
@@ -652,6 +335,8 @@ void prefix_copy(struct prefix *dest, const struct prefix *src)
 		len = src->u.prefix_flowspec.prefixlen;
 		dest->u.prefix_flowspec.prefixlen =
 			src->u.prefix_flowspec.prefixlen;
+		dest->u.prefix_flowspec.family =
+			src->u.prefix_flowspec.family;
 		dest->family = src->family;
 		temp = XCALLOC(MTYPE_PREFIX_FLOWSPEC, len);
 		dest->u.prefix_flowspec.ptr = (uintptr_t)temp;
@@ -673,8 +358,11 @@ void prefix_copy(struct prefix *dest, const struct prefix *src)
  * the same.  Note that this routine has the same return value sense
  * as '==' (which is different from prefix_cmp).
  */
-int prefix_same(const struct prefix *p1, const struct prefix *p2)
+int prefix_same(union prefixconstptr up1, union prefixconstptr up2)
 {
+	const struct prefix *p1 = up1.p;
+	const struct prefix *p2 = up2.p;
+
 	if ((p1 && !p2) || (!p1 && p2))
 		return 0;
 
@@ -698,6 +386,9 @@ int prefix_same(const struct prefix *p1, const struct prefix *p2)
 				    sizeof(struct evpn_addr)))
 				return 1;
 		if (p1->family == AF_FLOWSPEC) {
+			if (p1->u.prefix_flowspec.family !=
+			    p2->u.prefix_flowspec.family)
+				return 0;
 			if (p1->u.prefix_flowspec.prefixlen !=
 			    p2->u.prefix_flowspec.prefixlen)
 				return 0;
@@ -711,55 +402,71 @@ int prefix_same(const struct prefix *p1, const struct prefix *p2)
 }
 
 /*
- * Return 0 if the network prefixes represented by the struct prefix
- * arguments are the same prefix, and 1 otherwise.  Network prefixes
- * are considered the same if the prefix lengths are equal and the
- * network parts are the same.  Host bits (which are considered masked
+ * Return -1/0/1 comparing the prefixes in a way that gives a full/linear
+ * order.
+ *
+ * Network prefixes are considered the same if the prefix lengths are equal
+ * and the network parts are the same.  Host bits (which are considered masked
  * by the prefix length) are not significant.  Thus, 10.0.0.1/8 and
  * 10.0.0.2/8 are considered equivalent by this routine.  Note that
  * this routine has the same return sense as strcmp (which is different
  * from prefix_same).
  */
-int prefix_cmp(const struct prefix *p1, const struct prefix *p2)
+int prefix_cmp(union prefixconstptr up1, union prefixconstptr up2)
 {
+	const struct prefix *p1 = up1.p;
+	const struct prefix *p2 = up2.p;
 	int offset;
 	int shift;
+	int i;
 
 	/* Set both prefix's head pointer. */
 	const uint8_t *pp1;
 	const uint8_t *pp2;
 
 	if (p1->family != p2->family)
-		return 1;
+		return numcmp(p1->family, p2->family);
 	if (p1->family == AF_FLOWSPEC) {
 		pp1 = (const uint8_t *)p1->u.prefix_flowspec.ptr;
 		pp2 = (const uint8_t *)p2->u.prefix_flowspec.ptr;
 
+		if (p1->u.prefix_flowspec.family !=
+		    p2->u.prefix_flowspec.family)
+			return 1;
+
 		if (p1->u.prefix_flowspec.prefixlen !=
 		    p2->u.prefix_flowspec.prefixlen)
-			return 1;
+			return numcmp(p1->u.prefix_flowspec.prefixlen,
+				      p2->u.prefix_flowspec.prefixlen);
 
 		offset = p1->u.prefix_flowspec.prefixlen;
 		while (offset--)
 			if (pp1[offset] != pp2[offset])
-				return 1;
+				return numcmp(pp1[offset], pp2[offset]);
 		return 0;
 	}
 	pp1 = p1->u.val;
 	pp2 = p2->u.val;
 
 	if (p1->prefixlen != p2->prefixlen)
-		return 1;
+		return numcmp(p1->prefixlen, p2->prefixlen);
 	offset = p1->prefixlen / PNBBY;
 	shift = p1->prefixlen % PNBBY;
 
-	if (shift)
-		if (maskbit[shift] & (pp1[offset] ^ pp2[offset]))
-			return 1;
+	i = memcmp(pp1, pp2, offset);
+	if (i)
+		return i;
 
-	while (offset--)
-		if (pp1[offset] != pp2[offset])
-			return 1;
+	/*
+	 * At this point offset was the same, if we have shift
+	 * that means we still have data to compare, if shift is
+	 * 0 then we are at the end of the data structure
+	 * and should just return, as that we will be accessing
+	 * memory beyond the end of the party zone
+	 */
+	if (shift)
+		return numcmp(pp1[offset] & maskbit[shift],
+			      pp2[offset] & maskbit[shift]);
 
 	return 0;
 }
@@ -770,8 +477,10 @@ int prefix_cmp(const struct prefix *p1, const struct prefix *p2)
  * address families don't match, return -1; otherwise the return value is
  * in range 0 ... maximum prefix length for the address family.
  */
-int prefix_common_bits(const struct prefix *p1, const struct prefix *p2)
+int prefix_common_bits(union prefixconstptr ua, union prefixconstptr ub)
 {
+	const struct prefix *p1 = ua.p;
+	const struct prefix *p2 = ub.p;
 	int pos, bit;
 	int length = 0;
 	uint8_t xor ;
@@ -807,8 +516,10 @@ int prefix_common_bits(const struct prefix *p1, const struct prefix *p2)
 }
 
 /* Return prefix family type string. */
-const char *prefix_family_str(const struct prefix *p)
+const char *prefix_family_str(union prefixconstptr pu)
 {
+	const struct prefix *p = pu.p;
+
 	if (p->family == AF_INET)
 		return "inet";
 	if (p->family == AF_INET6)
@@ -835,12 +546,12 @@ struct prefix_ipv4 *prefix_ipv4_new(void)
 }
 
 /* Free prefix_ipv4 structure. */
-void prefix_ipv4_free(struct prefix_ipv4 *p)
+void prefix_ipv4_free(struct prefix_ipv4 **p)
 {
-	prefix_free((struct prefix *)p);
+	prefix_free((struct prefix **)p);
 }
 
-/* When string format is invalid return 0. */
+/* If given string is valid return 1 else return 0 */
 int str2prefix_ipv4(const char *str, struct prefix_ipv4 *p)
 {
 	int ret;
@@ -868,12 +579,14 @@ int str2prefix_ipv4(const char *str, struct prefix_ipv4 *p)
 		cp = XMALLOC(MTYPE_TMP, (pnt - str) + 1);
 		memcpy(cp, str, pnt - str);
 		*(cp + (pnt - str)) = '\0';
-		ret = inet_aton(cp, &p->prefix);
+		ret = inet_pton(AF_INET, cp, &p->prefix);
 		XFREE(MTYPE_TMP, cp);
+		if (ret == 0)
+			return 0;
 
 		/* Get prefix length. */
 		plen = (uint8_t)atoi(++pnt);
-		if (plen > IPV4_MAX_PREFIXLEN)
+		if (plen > IPV4_MAX_BITLEN)
 			return 0;
 
 		p->family = AF_INET;
@@ -989,7 +702,7 @@ void apply_mask_ipv4(struct prefix_ipv4 *p)
 /* If prefix is 0.0.0.0/0 then return 1 else return 0. */
 int prefix_ipv4_any(const struct prefix_ipv4 *p)
 {
-	return (p->prefix.s_addr == 0 && p->prefixlen == 0);
+	return (p->prefix.s_addr == INADDR_ANY && p->prefixlen == 0);
 }
 
 /* Allocate a new ip version 6 route */
@@ -1005,12 +718,12 @@ struct prefix_ipv6 *prefix_ipv6_new(void)
 }
 
 /* Free prefix for IPv6. */
-void prefix_ipv6_free(struct prefix_ipv6 *p)
+void prefix_ipv6_free(struct prefix_ipv6 **p)
 {
-	prefix_free((struct prefix *)p);
+	prefix_free((struct prefix **)p);
 }
 
-/* If given string is valid return pin6 else return NULL */
+/* If given string is valid return 1 else return 0 */
 int str2prefix_ipv6(const char *str, struct prefix_ipv6 *p)
 {
 	char *pnt;
@@ -1049,31 +762,46 @@ int str2prefix_ipv6(const char *str, struct prefix_ipv6 *p)
  * FIXME return uint8_t as ip_maskleni() does. */
 int ip6_masklen(struct in6_addr netmask)
 {
-	int len = 0;
-	unsigned char val;
-	unsigned char *pnt;
-
-	pnt = (unsigned char *)&netmask;
-
-	while ((*pnt == 0xff) && len < IPV6_MAX_BITLEN) {
-		len += 8;
-		pnt++;
-	}
-
-	if (len < IPV6_MAX_BITLEN) {
-		val = *pnt;
-		while (val) {
-			len++;
-			val <<= 1;
-		}
-	}
-	return len;
+	if (netmask.s6_addr32[0] != 0xffffffffU)
+		return __builtin_clz(~ntohl(netmask.s6_addr32[0]));
+	if (netmask.s6_addr32[1] != 0xffffffffU)
+		return __builtin_clz(~ntohl(netmask.s6_addr32[1])) + 32;
+	if (netmask.s6_addr32[2] != 0xffffffffU)
+		return __builtin_clz(~ntohl(netmask.s6_addr32[2])) + 64;
+	if (netmask.s6_addr32[3] != 0xffffffffU)
+		return __builtin_clz(~ntohl(netmask.s6_addr32[3])) + 96;
+	/* note __builtin_clz(0) is undefined */
+	return 128;
 }
 
 void masklen2ip6(const int masklen, struct in6_addr *netmask)
 {
 	assert(masklen >= 0 && masklen <= IPV6_MAX_BITLEN);
-	memcpy(netmask, maskbytes6 + masklen, sizeof(struct in6_addr));
+
+	if (masklen == 0) {
+		/* note << 32 is undefined */
+		memset(netmask, 0, sizeof(*netmask));
+	} else if (masklen <= 32) {
+		netmask->s6_addr32[0] = htonl(0xffffffffU << (32 - masklen));
+		netmask->s6_addr32[1] = 0;
+		netmask->s6_addr32[2] = 0;
+		netmask->s6_addr32[3] = 0;
+	} else if (masklen <= 64) {
+		netmask->s6_addr32[0] = 0xffffffffU;
+		netmask->s6_addr32[1] = htonl(0xffffffffU << (64 - masklen));
+		netmask->s6_addr32[2] = 0;
+		netmask->s6_addr32[3] = 0;
+	} else if (masklen <= 96) {
+		netmask->s6_addr32[0] = 0xffffffffU;
+		netmask->s6_addr32[1] = 0xffffffffU;
+		netmask->s6_addr32[2] = htonl(0xffffffffU << (96 - masklen));
+		netmask->s6_addr32[3] = 0;
+	} else {
+		netmask->s6_addr32[0] = 0xffffffffU;
+		netmask->s6_addr32[1] = 0xffffffffU;
+		netmask->s6_addr32[2] = 0xffffffffU;
+		netmask->s6_addr32[3] = htonl(0xffffffffU << (128 - masklen));
+	}
 }
 
 void apply_mask_ipv6(struct prefix_ipv6 *p)
@@ -1096,46 +824,21 @@ void apply_mask_ipv6(struct prefix_ipv6 *p)
 	}
 }
 
-void apply_mask(struct prefix *p)
+void apply_mask(union prefixptr pu)
 {
+	struct prefix *p = pu.p;
+
 	switch (p->family) {
 	case AF_INET:
-		apply_mask_ipv4((struct prefix_ipv4 *)p);
+		apply_mask_ipv4(pu.p4);
 		break;
 	case AF_INET6:
-		apply_mask_ipv6((struct prefix_ipv6 *)p);
+		apply_mask_ipv6(pu.p6);
 		break;
 	default:
 		break;
 	}
 	return;
-}
-
-/* Utility function of convert between struct prefix <=> union sockunion.
- * FIXME This function isn't used anywhere. */
-struct prefix *sockunion2prefix(const union sockunion *dest,
-				const union sockunion *mask)
-{
-	if (dest->sa.sa_family == AF_INET) {
-		struct prefix_ipv4 *p;
-
-		p = prefix_ipv4_new();
-		p->family = AF_INET;
-		p->prefix = dest->sin.sin_addr;
-		p->prefixlen = ip_masklen(mask->sin.sin_addr);
-		return (struct prefix *)p;
-	}
-	if (dest->sa.sa_family == AF_INET6) {
-		struct prefix_ipv6 *p;
-
-		p = prefix_ipv6_new();
-		p->family = AF_INET6;
-		p->prefixlen = ip6_masklen(mask->sin6.sin6_addr);
-		memcpy(&p->prefix, &dest->sin6.sin6_addr,
-		       sizeof(struct in6_addr));
-		return (struct prefix *)p;
-	}
-	return NULL;
 }
 
 /* Utility function of convert between struct prefix <=> union sockunion. */
@@ -1176,18 +879,17 @@ void prefix2sockunion(const struct prefix *p, union sockunion *su)
 		       sizeof(struct in6_addr));
 }
 
-int prefix_blen(const struct prefix *p)
+int prefix_blen(union prefixconstptr pu)
 {
+	const struct prefix *p = pu.p;
+
 	switch (p->family) {
 	case AF_INET:
 		return IPV4_MAX_BYTELEN;
-		break;
 	case AF_INET6:
 		return IPV6_MAX_BYTELEN;
-		break;
 	case AF_ETHERNET:
 		return ETH_ALEN;
-		break;
 	}
 	return 0;
 }
@@ -1221,7 +923,18 @@ int str2prefix(const char *str, struct prefix *p)
 static const char *prefixevpn_ead2str(const struct prefix_evpn *p, char *str,
 				      int size)
 {
-	snprintf(str, size, "Unsupported EVPN prefix");
+	uint8_t family;
+	char buf[ESI_STR_LEN];
+	char buf1[INET6_ADDRSTRLEN];
+
+	family = IS_IPADDR_V4(&p->prefix.ead_addr.ip) ? AF_INET : AF_INET6;
+	snprintf(str, size, "[%d]:[%u]:[%s]:[%d]:[%s]:[%u]",
+		 p->prefix.route_type, p->prefix.ead_addr.eth_tag,
+		 esi_to_str(&p->prefix.ead_addr.esi, buf, sizeof(buf)),
+		 (family == AF_INET) ? IPV4_MAX_BITLEN : IPV6_MAX_BITLEN,
+		 inet_ntop(family, &p->prefix.ead_addr.ip.ipaddr_v4, buf1,
+			   sizeof(buf1)),
+		 p->prefix.ead_addr.frag_id);
 	return str;
 }
 
@@ -1229,27 +942,24 @@ static const char *prefixevpn_macip2str(const struct prefix_evpn *p, char *str,
 					int size)
 {
 	uint8_t family;
-	char buf[PREFIX2STR_BUFFER];
-	char buf2[ETHER_ADDR_STRLEN];
+	char buf1[ETHER_ADDR_STRLEN];
+	char buf2[PREFIX2STR_BUFFER];
 
 	if (is_evpn_prefix_ipaddr_none(p))
-		snprintf(str, size, "[%d]:[%s]/%d",
-			 p->prefix.route_type,
-			 prefix_mac2str(&p->prefix.macip_addr.mac,
-					buf2, sizeof(buf2)),
-			 p->prefixlen);
+		snprintf(str, size, "[%d]:[%d]:[%d]:[%s]", p->prefix.route_type,
+			 p->prefix.macip_addr.eth_tag, 8 * ETH_ALEN,
+			 prefix_mac2str(&p->prefix.macip_addr.mac, buf1,
+					sizeof(buf1)));
 	else {
-		family = is_evpn_prefix_ipaddr_v4(p)
-				 ? AF_INET
-				 : AF_INET6;
-		snprintf(str, size, "[%d]:[%s]:[%s]/%d",
-			 p->prefix.route_type,
-			 prefix_mac2str(&p->prefix.macip_addr.mac,
-					buf2, sizeof(buf2)),
-			 inet_ntop(family,
-				   &p->prefix.macip_addr.ip.ip.addr,
-				   buf, PREFIX2STR_BUFFER),
-			 p->prefixlen);
+		family = is_evpn_prefix_ipaddr_v4(p) ? AF_INET : AF_INET6;
+		snprintf(str, size, "[%d]:[%d]:[%d]:[%s]:[%d]:[%s]",
+			 p->prefix.route_type, p->prefix.macip_addr.eth_tag,
+			 8 * ETH_ALEN,
+			 prefix_mac2str(&p->prefix.macip_addr.mac, buf1,
+					sizeof(buf1)),
+			 family == AF_INET ? IPV4_MAX_BITLEN : IPV6_MAX_BITLEN,
+			 inet_ntop(family, &p->prefix.macip_addr.ip.ip.addr,
+				   buf2, PREFIX2STR_BUFFER));
 	}
 	return str;
 }
@@ -1258,28 +968,32 @@ static const char *prefixevpn_imet2str(const struct prefix_evpn *p, char *str,
 				       int size)
 {
 	uint8_t family;
-	char buf[PREFIX2STR_BUFFER];
+	char buf[INET6_ADDRSTRLEN];
 
-	family = is_evpn_prefix_ipaddr_v4(p)
-			 ? AF_INET
-			 : AF_INET6;
-	snprintf(str, size, "[%d]:[%s]/%d", p->prefix.route_type,
-		 inet_ntop(family,
-			   &p->prefix.imet_addr.ip.ip.addr, buf,
-			   PREFIX2STR_BUFFER),
-		 p->prefixlen);
+	family = IS_IPADDR_V4(&p->prefix.imet_addr.ip) ? AF_INET : AF_INET6;
+	snprintf(str, size, "[%d]:[%d]:[%d]:[%s]", p->prefix.route_type,
+		 p->prefix.imet_addr.eth_tag,
+		 (family == AF_INET) ? IPV4_MAX_BITLEN : IPV6_MAX_BITLEN,
+		 inet_ntop(family, &p->prefix.imet_addr.ip.ipaddr_v4, buf,
+			   sizeof(buf)));
+
 	return str;
 }
 
 static const char *prefixevpn_es2str(const struct prefix_evpn *p, char *str,
 				     int size)
 {
+	uint8_t family;
 	char buf[ESI_STR_LEN];
+	char buf1[INET6_ADDRSTRLEN];
 
-	snprintf(str, size, "[%d]:[%s]:[%s]/%d", p->prefix.route_type,
+	family = IS_IPADDR_V4(&p->prefix.es_addr.ip) ? AF_INET : AF_INET6;
+	snprintf(str, size, "[%d]:[%s]:[%d]:[%s]", p->prefix.route_type,
 		 esi_to_str(&p->prefix.es_addr.esi, buf, sizeof(buf)),
-		 inet_ntoa(p->prefix.es_addr.ip.ipaddr_v4),
-		 p->prefixlen);
+		 (family == AF_INET) ? IPV4_MAX_BITLEN : IPV6_MAX_BITLEN,
+		 inet_ntop(family, &p->prefix.es_addr.ip.ipaddr_v4, buf1,
+			   sizeof(buf1)));
+
 	return str;
 }
 
@@ -1287,19 +1001,14 @@ static const char *prefixevpn_prefix2str(const struct prefix_evpn *p, char *str,
 					 int size)
 {
 	uint8_t family;
-	char buf[PREFIX2STR_BUFFER];
+	char buf[INET6_ADDRSTRLEN];
 
-	family = is_evpn_prefix_ipaddr_v4(p)
-			 ? AF_INET
-			 : AF_INET6;
-	snprintf(str, size, "[%d]:[%u][%s/%d]/%d",
-		 p->prefix.route_type,
+	family = IS_IPADDR_V4(&p->prefix.prefix_addr.ip) ? AF_INET : AF_INET6;
+	snprintf(str, size, "[%d]:[%d]:[%d]:[%s]", p->prefix.route_type,
 		 p->prefix.prefix_addr.eth_tag,
-		 inet_ntop(family,
-			   &p->prefix.prefix_addr.ip.ip.addr, buf,
-			   PREFIX2STR_BUFFER),
 		 p->prefix.prefix_addr.ip_prefix_length,
-		 p->prefixlen);
+		 inet_ntop(family, &p->prefix.prefix_addr.ip.ipaddr_v4, buf,
+			   sizeof(buf)));
 	return str;
 }
 
@@ -1307,15 +1016,15 @@ static const char *prefixevpn2str(const struct prefix_evpn *p, char *str,
 				  int size)
 {
 	switch (p->prefix.route_type) {
-	case 1:
+	case BGP_EVPN_AD_ROUTE:
 		return prefixevpn_ead2str(p, str, size);
-	case 2:
+	case BGP_EVPN_MAC_IP_ROUTE:
 		return prefixevpn_macip2str(p, str, size);
-	case 3:
+	case BGP_EVPN_IMET_ROUTE:
 		return prefixevpn_imet2str(p, str, size);
-	case 4:
+	case BGP_EVPN_ES_ROUTE:
 		return prefixevpn_es2str(p, str, size);
-	case 5:
+	case BGP_EVPN_IP_PREFIX_ROUTE:
 		return prefixevpn_prefix2str(p, str, size);
 	default:
 		snprintf(str, size, "Unsupported EVPN prefix");
@@ -1328,13 +1037,30 @@ const char *prefix2str(union prefixconstptr pu, char *str, int size)
 {
 	const struct prefix *p = pu.p;
 	char buf[PREFIX2STR_BUFFER];
+	int byte, tmp, a, b;
+	bool z = false;
+	size_t l;
 
 	switch (p->family) {
 	case AF_INET:
 	case AF_INET6:
-		snprintf(str, size, "%s/%d", inet_ntop(p->family, &p->u.prefix,
-						       buf, PREFIX2STR_BUFFER),
-			 p->prefixlen);
+		inet_ntop(p->family, &p->u.prefix, buf, sizeof(buf));
+		l = strlen(buf);
+		buf[l++] = '/';
+		byte = p->prefixlen;
+		tmp = p->prefixlen - 100;
+		if (tmp >= 0) {
+			buf[l++] = '1';
+			z = true;
+			byte = tmp;
+		}
+		b = byte % 10;
+		a = byte / 10;
+		if (a || z)
+			buf[l++] = '0' + a;
+		buf[l++] = '0' + b;
+		buf[l] = '\0';
+		strlcpy(str, buf, size);
 		break;
 
 	case AF_ETHERNET:
@@ -1348,15 +1074,35 @@ const char *prefix2str(union prefixconstptr pu, char *str, int size)
 		break;
 
 	case AF_FLOWSPEC:
-		sprintf(str, "FS prefix");
+		strlcpy(str, "FS prefix", size);
 		break;
 
 	default:
-		sprintf(str, "UNK prefix");
+		strlcpy(str, "UNK prefix", size);
 		break;
 	}
 
 	return str;
+}
+
+static ssize_t prefixhost2str(struct fbuf *fbuf, union prefixconstptr pu)
+{
+	const struct prefix *p = pu.p;
+	char buf[PREFIX2STR_BUFFER];
+
+	switch (p->family) {
+	case AF_INET:
+	case AF_INET6:
+		inet_ntop(p->family, &p->u.prefix, buf, sizeof(buf));
+		return bputs(fbuf, buf);
+
+	case AF_ETHERNET:
+		prefix_mac2str(&p->u.prefix_eth, buf, sizeof(buf));
+		return bputs(fbuf, buf);
+
+	default:
+		return bprintfrr(fbuf, "{prefix.af=%dPF}", p->family);
+	}
 }
 
 void prefix_mcast_inet4_dump(const char *onfail, struct in_addr addr,
@@ -1365,7 +1111,7 @@ void prefix_mcast_inet4_dump(const char *onfail, struct in_addr addr,
 	int save_errno = errno;
 
 	if (addr.s_addr == INADDR_ANY)
-		strcpy(buf, "*");
+		strlcpy(buf, "*", buf_size);
 	else {
 		if (!inet_ntop(AF_INET, &addr, buf, buf_size)) {
 			if (onfail)
@@ -1392,14 +1138,21 @@ struct prefix *prefix_new(void)
 {
 	struct prefix *p;
 
-	p = XCALLOC(MTYPE_PREFIX, sizeof *p);
+	p = XCALLOC(MTYPE_PREFIX, sizeof(*p));
 	return p;
 }
 
-/* Free prefix structure. */
-void prefix_free(struct prefix *p)
+void prefix_free_lists(void *arg)
 {
-	XFREE(MTYPE_PREFIX, p);
+	struct prefix *p = arg;
+
+	prefix_free(&p);
+}
+
+/* Free prefix structure. */
+void prefix_free(struct prefix **p)
+{
+	XFREE(MTYPE_PREFIX, *p);
 }
 
 /* Utility function to convert ipv4 prefixes to Classful prefixes */
@@ -1410,7 +1163,7 @@ void apply_classful_mask_ipv4(struct prefix_ipv4 *p)
 
 	destination = ntohl(p->prefix.s_addr);
 
-	if (p->prefixlen == IPV4_MAX_PREFIXLEN)
+	if (p->prefixlen == IPV4_MAX_BITLEN)
 		;
 	/* do nothing for host routes */
 	else if (IN_CLASSC(destination)) {
@@ -1425,32 +1178,25 @@ void apply_classful_mask_ipv4(struct prefix_ipv4 *p)
 	}
 }
 
-in_addr_t ipv4_network_addr(in_addr_t hostaddr, int masklen)
-{
-	struct in_addr mask;
-
-	masklen2ip(masklen, &mask);
-	return hostaddr & mask.s_addr;
-}
-
 in_addr_t ipv4_broadcast_addr(in_addr_t hostaddr, int masklen)
 {
 	struct in_addr mask;
 
 	masklen2ip(masklen, &mask);
-	return (masklen != IPV4_MAX_PREFIXLEN - 1) ?
-						   /* normal case */
+	return (masklen != IPV4_MAX_BITLEN - 1)
+		       ?
+		       /* normal case */
 		       (hostaddr | ~mask.s_addr)
-						   :
-						   /* special case for /31 */
-		       (hostaddr ^ ~mask.s_addr);
+		       :
+		       /* For prefix 31 return 255.255.255.255 (RFC3021) */
+		       htonl(0xFFFFFFFF);
 }
 
 /* Utility function to convert ipv4 netmask to prefixes
    ex.) "1.1.0.0" "255.255.0.0" => "1.1.0.0/16"
    ex.) "1.0.0.0" NULL => "1.0.0.0/8"                   */
 int netmask_str2prefix_str(const char *net_str, const char *mask_str,
-			   char *prefix_str)
+			   char *prefix_str, size_t prefix_str_len)
 {
 	struct in_addr network;
 	struct in_addr mask;
@@ -1471,7 +1217,7 @@ int netmask_str2prefix_str(const char *net_str, const char *mask_str,
 	} else {
 		destination = ntohl(network.s_addr);
 
-		if (network.s_addr == 0)
+		if (network.s_addr == INADDR_ANY)
 			prefixlen = 0;
 		else if (IN_CLASSC(destination))
 			prefixlen = 24;
@@ -1483,18 +1229,9 @@ int netmask_str2prefix_str(const char *net_str, const char *mask_str,
 			return 0;
 	}
 
-	sprintf(prefix_str, "%s/%d", net_str, prefixlen);
+	snprintf(prefix_str, prefix_str_len, "%s/%d", net_str, prefixlen);
 
 	return 1;
-}
-
-/* Utility function for making IPv6 address string. */
-const char *inet6_ntoa(struct in6_addr addr)
-{
-	static char buf[INET6_ADDRSTRLEN];
-
-	inet_ntop(AF_INET6, &addr, buf, INET6_ADDRSTRLEN);
-	return buf;
 }
 
 /* converts to internal representation of mac address
@@ -1543,7 +1280,7 @@ char *prefix_mac2str(const struct ethaddr *mac, char *buf, int size)
 	return ptr;
 }
 
-unsigned prefix_hash_key(void *pp)
+unsigned prefix_hash_key(const void *pp)
 {
 	struct prefix copy;
 
@@ -1625,4 +1362,192 @@ char *esi_to_str(const esi_t *esi, char *buf, int size)
 		 esi->val[6], esi->val[7], esi->val[8],
 		 esi->val[9]);
 	return ptr;
+}
+
+char *evpn_es_df_alg2str(uint8_t df_alg, char *buf, int buf_len)
+{
+	switch (df_alg) {
+	case EVPN_MH_DF_ALG_SERVICE_CARVING:
+		snprintf(buf, buf_len, "service-carving");
+		break;
+
+	case EVPN_MH_DF_ALG_HRW:
+		snprintf(buf, buf_len, "HRW");
+		break;
+
+	case EVPN_MH_DF_ALG_PREF:
+		snprintf(buf, buf_len, "preference");
+		break;
+
+	default:
+		snprintf(buf, buf_len, "unknown %u", df_alg);
+		break;
+	}
+
+	return buf;
+}
+
+bool ipv4_unicast_valid(const struct in_addr *addr)
+{
+	in_addr_t ip = ntohl(addr->s_addr);
+
+	if (IPV4_CLASS_D(ip))
+		return false;
+
+	if (IPV4_CLASS_E(ip)) {
+		if (cmd_allow_reserved_ranges_get())
+			return true;
+		else
+			return false;
+	}
+
+	return true;
+}
+
+printfrr_ext_autoreg_p("EA", printfrr_ea);
+static ssize_t printfrr_ea(struct fbuf *buf, struct printfrr_eargs *ea,
+			   const void *ptr)
+{
+	const struct ethaddr *mac = ptr;
+	char cbuf[ETHER_ADDR_STRLEN];
+
+	if (!mac)
+		return bputs(buf, "(null)");
+
+	/* need real length even if buffer is too short */
+	prefix_mac2str(mac, cbuf, sizeof(cbuf));
+	return bputs(buf, cbuf);
+}
+
+printfrr_ext_autoreg_p("IA", printfrr_ia);
+static ssize_t printfrr_ia(struct fbuf *buf, struct printfrr_eargs *ea,
+			   const void *ptr)
+{
+	const struct ipaddr *ipa = ptr;
+	char cbuf[INET6_ADDRSTRLEN];
+	bool use_star = false;
+
+	if (ea->fmt[0] == 's') {
+		use_star = true;
+		ea->fmt++;
+	}
+
+	if (!ipa)
+		return bputs(buf, "(null)");
+
+	if (use_star) {
+		struct in_addr zero4 = {};
+		struct in6_addr zero6 = {};
+
+		switch (ipa->ipa_type) {
+		case IPADDR_V4:
+			if (!memcmp(&ipa->ip.addr, &zero4, sizeof(zero4)))
+				return bputch(buf, '*');
+			break;
+
+		case IPADDR_V6:
+			if (!memcmp(&ipa->ip.addr, &zero6, sizeof(zero6)))
+				return bputch(buf, '*');
+			break;
+
+		default:
+			break;
+		}
+	}
+
+	ipaddr2str(ipa, cbuf, sizeof(cbuf));
+	return bputs(buf, cbuf);
+}
+
+printfrr_ext_autoreg_p("I4", printfrr_i4);
+static ssize_t printfrr_i4(struct fbuf *buf, struct printfrr_eargs *ea,
+			   const void *ptr)
+{
+	char cbuf[INET_ADDRSTRLEN];
+	bool use_star = false;
+	struct in_addr zero = {};
+
+	if (ea->fmt[0] == 's') {
+		use_star = true;
+		ea->fmt++;
+	}
+
+	if (!ptr)
+		return bputs(buf, "(null)");
+
+	if (use_star && !memcmp(ptr, &zero, sizeof(zero)))
+		return bputch(buf, '*');
+
+	inet_ntop(AF_INET, ptr, cbuf, sizeof(cbuf));
+	return bputs(buf, cbuf);
+}
+
+printfrr_ext_autoreg_p("I6", printfrr_i6);
+static ssize_t printfrr_i6(struct fbuf *buf, struct printfrr_eargs *ea,
+			   const void *ptr)
+{
+	char cbuf[INET6_ADDRSTRLEN];
+	bool use_star = false;
+	struct in6_addr zero = {};
+
+	if (ea->fmt[0] == 's') {
+		use_star = true;
+		ea->fmt++;
+	}
+
+	if (!ptr)
+		return bputs(buf, "(null)");
+
+	if (use_star && !memcmp(ptr, &zero, sizeof(zero)))
+		return bputch(buf, '*');
+
+	inet_ntop(AF_INET6, ptr, cbuf, sizeof(cbuf));
+	return bputs(buf, cbuf);
+}
+
+printfrr_ext_autoreg_p("FX", printfrr_pfx);
+static ssize_t printfrr_pfx(struct fbuf *buf, struct printfrr_eargs *ea,
+			    const void *ptr)
+{
+	bool host_only = false;
+
+	if (ea->fmt[0] == 'h') {
+		ea->fmt++;
+		host_only = true;
+	}
+
+	if (!ptr)
+		return bputs(buf, "(null)");
+
+	if (host_only)
+		return prefixhost2str(buf, (struct prefix *)ptr);
+	else {
+		char cbuf[PREFIX_STRLEN];
+
+		prefix2str(ptr, cbuf, sizeof(cbuf));
+		return bputs(buf, cbuf);
+	}
+}
+
+printfrr_ext_autoreg_p("PSG4", printfrr_psg);
+static ssize_t printfrr_psg(struct fbuf *buf, struct printfrr_eargs *ea,
+			    const void *ptr)
+{
+	const struct prefix_sg *sg = ptr;
+	ssize_t ret = 0;
+
+	if (!sg)
+		return bputs(buf, "(null)");
+
+	if (sg->src.s_addr == INADDR_ANY)
+		ret += bputs(buf, "(*,");
+	else
+		ret += bprintfrr(buf, "(%pI4,", &sg->src);
+
+	if (sg->grp.s_addr == INADDR_ANY)
+		ret += bputs(buf, "*)");
+	else
+		ret += bprintfrr(buf, "%pI4)", &sg->grp);
+
+	return ret;
 }

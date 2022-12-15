@@ -23,7 +23,13 @@
 
 #include "lib/memory.h"
 
-DECLARE_MGROUP(WATCHFRR)
+DECLARE_MGROUP(WATCHFRR);
+
+/*
+ * This is the name of the pathspace we are in `-N XXX`
+ * If the default then this is NULL
+ */
+extern const char *pathspace;
 
 extern void watchfrr_vty_init(void);
 
@@ -41,4 +47,6 @@ extern void watchfrr_status(struct vty *vty);
  */
 extern bool check_all_up(void);
 
+extern void watchfrr_set_ignore_daemon(struct vty *vty, const char *dname,
+				       bool ignore);
 #endif /* FRR_WATCHFRR_H */

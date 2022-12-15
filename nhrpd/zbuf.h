@@ -15,19 +15,22 @@
 #include <endian.h>
 #include <sys/types.h>
 
-#include "zassert.h"
-#include "list.h"
+#include "typesafe.h"
+
+PREDECL_DLIST(zbuf_queue);
 
 struct zbuf {
-	struct list_head queue_list;
+	struct zbuf_queue_item queue_entry;
 	unsigned allocated : 1;
 	unsigned error : 1;
 	uint8_t *buf, *end;
 	uint8_t *head, *tail;
 };
 
+DECLARE_DLIST(zbuf_queue, struct zbuf, queue_entry);
+
 struct zbuf_queue {
-	struct list_head queue_head;
+	struct zbuf_queue_head queue_head;
 };
 
 struct zbuf *zbuf_alloc(size_t size);
@@ -86,9 +89,9 @@ static inline void *__zbuf_pull(struct zbuf *zb, size_t size, int error)
 }
 
 #define zbuf_pull(zb, type) ((type *)__zbuf_pull(zb, sizeof(type), 1))
-#define zbuf_pulln(zb, sz) ((void *)__zbuf_pull(zb, sz, 1))
+#define zbuf_pulln(zb, sz) (__zbuf_pull(zb, sz, 1))
 #define zbuf_may_pull(zb, type) ((type *)__zbuf_pull(zb, sizeof(type), 0))
-#define zbuf_may_pulln(zb, sz) ((void *)__zbuf_pull(zb, sz, 0))
+#define zbuf_may_pulln(zb, sz) (__zbuf_pull(zb, sz, 0))
 
 void *zbuf_may_pull_until(struct zbuf *zb, const char *sep, struct zbuf *msg);
 
@@ -149,9 +152,9 @@ static inline void *__zbuf_push(struct zbuf *zb, size_t size, int error)
 }
 
 #define zbuf_push(zb, type) ((type *)__zbuf_push(zb, sizeof(type), 1))
-#define zbuf_pushn(zb, sz) ((void *)__zbuf_push(zb, sz, 1))
+#define zbuf_pushn(zb, sz) (__zbuf_push(zb, sz, 1))
 #define zbuf_may_push(zb, type) ((type *)__zbuf_may_push(zb, sizeof(type), 0))
-#define zbuf_may_pushn(zb, sz) ((void *)__zbuf_push(zb, sz, 0))
+#define zbuf_may_pushn(zb, sz) (__zbuf_push(zb, sz, 0))
 
 static inline void zbuf_put(struct zbuf *zb, const void *src, size_t len)
 {
@@ -190,6 +193,7 @@ static inline void zbuf_put_be32(struct zbuf *zb, uint32_t val)
 }
 
 void zbuf_copy(struct zbuf *zb, struct zbuf *src, size_t len);
+void zbuf_copy_peek(struct zbuf *zdst, struct zbuf *zsrc, size_t len);
 
 void zbufq_init(struct zbuf_queue *);
 void zbufq_reset(struct zbuf_queue *);

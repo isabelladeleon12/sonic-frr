@@ -34,19 +34,15 @@ CDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ "${TOPOTEST_CLEAN}" != "0" ]; then
 	log_info "Cleaning FRR builddir..."
-	rm -rf $FRR_SYNC_DIR $FRR_BUILD_DIR &> /dev/null
+	rm -rf $FRR_BUILD_DIR &> /dev/null
 fi
 
 log_info "Syncing FRR source with host..."
-mkdir -p $FRR_SYNC_DIR
-rsync -a --info=progress2 \
-	--exclude '*.o' \
-	--exclude '*.lo'\
-	--chown root:root \
-	$FRR_HOST_DIR/. $FRR_SYNC_DIR/
-(cd $FRR_SYNC_DIR && git clean -xdf > /dev/null)
 mkdir -p $FRR_BUILD_DIR
-rsync -a --info=progress2 --chown root:root $FRR_SYNC_DIR/. $FRR_BUILD_DIR/
+rsync -a --info=progress2 \
+	--from0 --files-from=/tmp/git-ls-files \
+	--chown root:root \
+	$FRR_HOST_DIR/. $FRR_BUILD_DIR/
 
 cd "$FRR_BUILD_DIR" || \
 	log_fatal "failed to find frr directory"
@@ -84,6 +80,7 @@ if [ ! -e Makefile ]; then
 		--enable-static-bin \
 		--enable-static \
 		--enable-shared \
+		--enable-dev-build \
 		--with-moduledir=/usr/lib/frr/modules \
 		--prefix=/usr \
 		--localstatedir=/var/run/frr \

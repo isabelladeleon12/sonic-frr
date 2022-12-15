@@ -37,6 +37,7 @@
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_dump.h"
 #include "bgpd/bgp_errors.h"
+#include "bgpd/bgp_packet.h"
 
 enum bgp_dump_type {
 	BGP_DUMP_ALL,
@@ -87,7 +88,7 @@ struct bgp_dump {
 };
 
 static int bgp_dump_unset(struct bgp_dump *bgp_dump);
-static int bgp_dump_interval_func(struct thread *);
+static void bgp_dump_interval_func(struct thread *);
 
 /* BGP packet dump output buffer. */
 struct stream *bgp_dump_obuf;
@@ -105,22 +106,23 @@ static FILE *bgp_dump_open_file(struct bgp_dump *bgp_dump)
 {
 	int ret;
 	time_t clock;
-	struct tm *tm;
+	struct tm tm;
 	char fullpath[MAXPATHLEN];
 	char realpath[MAXPATHLEN];
 	mode_t oldumask;
 
 	time(&clock);
-	tm = localtime(&clock);
+	localtime_r(&clock, &tm);
 
 	if (bgp_dump->filename[0] != DIRECTORY_SEP) {
-		sprintf(fullpath, "%s/%s", vty_get_cwd(), bgp_dump->filename);
-		ret = strftime(realpath, MAXPATHLEN, fullpath, tm);
+		snprintf(fullpath, sizeof(fullpath), "%s/%s", vty_get_cwd(),
+			 bgp_dump->filename);
+		ret = strftime(realpath, MAXPATHLEN, fullpath, &tm);
 	} else
-		ret = strftime(realpath, MAXPATHLEN, bgp_dump->filename, tm);
+		ret = strftime(realpath, MAXPATHLEN, bgp_dump->filename, &tm);
 
 	if (ret == 0) {
-		flog_warn(EC_BGP_DUMP, "bgp_dump_open_file: strftime error");
+		flog_warn(EC_BGP_DUMP, "%s: strftime error", __func__);
 		return NULL;
 	}
 
@@ -132,7 +134,7 @@ static FILE *bgp_dump_open_file(struct bgp_dump *bgp_dump)
 	bgp_dump->fp = fopen(realpath, "w");
 
 	if (bgp_dump->fp == NULL) {
-		flog_warn(EC_BGP_DUMP, "bgp_dump_open_file: %s: %s", realpath,
+		flog_warn(EC_BGP_DUMP, "%s: %s: %s", __func__, realpath,
 			  strerror(errno));
 		umask(oldumask);
 		return NULL;
@@ -146,7 +148,7 @@ static int bgp_dump_interval_add(struct bgp_dump *bgp_dump, int interval)
 {
 	int secs_into_day;
 	time_t t;
-	struct tm *tm;
+	struct tm tm;
 
 	if (interval > 0) {
 		/* Periodic dump every interval seconds */
@@ -157,19 +159,17 @@ static int bgp_dump_interval_add(struct bgp_dump *bgp_dump, int interval)
 			 * midnight
 			 */
 			(void)time(&t);
-			tm = localtime(&t);
-			secs_into_day = tm->tm_sec + 60 * tm->tm_min
-					+ 60 * 60 * tm->tm_hour;
+			localtime_r(&t, &tm);
+			secs_into_day = tm.tm_sec + 60 * tm.tm_min
+					+ 60 * 60 * tm.tm_hour;
 			interval = interval
 				   - secs_into_day % interval; /* always > 0 */
 		}
-		bgp_dump->t_interval = NULL;
 		thread_add_timer(bm->master, bgp_dump_interval_func, bgp_dump,
 				 interval, &bgp_dump->t_interval);
 	} else {
 		/* One-off dump: execute immediately, don't affect any scheduled
 		 * dumps */
-		bgp_dump->t_interval = NULL;
 		thread_add_event(bm->master, bgp_dump_interval_func, bgp_dump,
 				 0, &bgp_dump->t_interval);
 	}
@@ -233,9 +233,9 @@ static void bgp_dump_routes_index_table(struct bgp *bgp)
 	stream_put_in_addr(obuf, &bgp->router_id);
 
 	/* View name */
-	if (bgp->name) {
-		stream_putw(obuf, strlen(bgp->name));
-		stream_put(obuf, bgp->name, strlen(bgp->name));
+	if (bgp->name_pretty) {
+		stream_putw(obuf, strlen(bgp->name_pretty));
+		stream_put(obuf, bgp->name_pretty, strlen(bgp->name_pretty));
 	} else {
 		stream_putw(obuf, 0);
 	}
@@ -298,22 +298,33 @@ static void bgp_dump_routes_index_table(struct bgp *bgp)
 	fflush(bgp_dump_routes.fp);
 }
 
-
 static struct bgp_path_info *
-bgp_dump_route_node_record(int afi, struct bgp_node *rn,
+bgp_dump_route_node_record(int afi, struct bgp_dest *dest,
 			   struct bgp_path_info *path, unsigned int seq)
 {
 	struct stream *obuf;
 	size_t sizep;
 	size_t endp;
+	bool addpath_capable;
+	const struct prefix *p = bgp_dest_get_prefix(dest);
 
 	obuf = bgp_dump_obuf;
 	stream_reset(obuf);
 
+	addpath_capable = bgp_addpath_encode_rx(path->peer, afi, SAFI_UNICAST);
+
 	/* MRT header */
-	if (afi == AFI_IP)
+	if (afi == AFI_IP && addpath_capable)
+		bgp_dump_header(obuf, MSG_TABLE_DUMP_V2,
+				TABLE_DUMP_V2_RIB_IPV4_UNICAST_ADDPATH,
+				BGP_DUMP_ROUTES);
+	else if (afi == AFI_IP)
 		bgp_dump_header(obuf, MSG_TABLE_DUMP_V2,
 				TABLE_DUMP_V2_RIB_IPV4_UNICAST,
+				BGP_DUMP_ROUTES);
+	else if (afi == AFI_IP6 && addpath_capable)
+		bgp_dump_header(obuf, MSG_TABLE_DUMP_V2,
+				TABLE_DUMP_V2_RIB_IPV6_UNICAST_ADDPATH,
 				BGP_DUMP_ROUTES);
 	else if (afi == AFI_IP6)
 		bgp_dump_header(obuf, MSG_TABLE_DUMP_V2,
@@ -324,19 +335,19 @@ bgp_dump_route_node_record(int afi, struct bgp_node *rn,
 	stream_putl(obuf, seq);
 
 	/* Prefix length */
-	stream_putc(obuf, rn->p.prefixlen);
+	stream_putc(obuf, p->prefixlen);
 
 	/* Prefix */
 	if (afi == AFI_IP) {
 		/* We'll dump only the useful bits (those not 0), but have to
 		 * align on 8 bits */
-		stream_write(obuf, (uint8_t *)&rn->p.u.prefix4,
-			     (rn->p.prefixlen + 7) / 8);
+		stream_write(obuf, (uint8_t *)&p->u.prefix4,
+			     (p->prefixlen + 7) / 8);
 	} else if (afi == AFI_IP6) {
 		/* We'll dump only the useful bits (those not 0), but have to
 		 * align on 8 bits */
-		stream_write(obuf, (uint8_t *)&rn->p.u.prefix6,
-			     (rn->p.prefixlen + 7) / 8);
+		stream_write(obuf, (uint8_t *)&p->u.prefix6,
+			     (p->prefixlen + 7) / 8);
 	}
 
 	/* Save where we are now, so we can overwride the entry count later */
@@ -356,14 +367,20 @@ bgp_dump_route_node_record(int afi, struct bgp_node *rn,
 		stream_putw(obuf, path->peer->table_dump_index);
 
 		/* Originated */
-		stream_putl(obuf, time(NULL) - (bgp_clock() - path->uptime));
+		stream_putl(obuf, time(NULL) - (monotime(NULL) - path->uptime));
+
+		/*Path Identifier*/
+		if (addpath_capable) {
+			stream_putl(obuf, path->addpath_rx_id);
+		}
 
 		/* Dump attribute. */
 		/* Skip prefix & AFI/SAFI for MP_NLRI */
-		bgp_dump_routes_attr(obuf, path->attr, &rn->p);
+		bgp_dump_routes_attr(obuf, path->attr, p);
 
 		cur_endp = stream_get_endp(obuf);
-		if (cur_endp > BGP_MAX_PACKET_SIZE + BGP_DUMP_MSG_HEADER
+		if (cur_endp > BGP_STANDARD_MESSAGE_MAX_PACKET_SIZE
+				       + BGP_DUMP_MSG_HEADER
 				       + BGP_DUMP_HEADER_SIZE) {
 			stream_set_endp(obuf, endp);
 			break;
@@ -388,7 +405,7 @@ static unsigned int bgp_dump_routes_func(int afi, int first_run,
 					 unsigned int seq)
 {
 	struct bgp_path_info *path;
-	struct bgp_node *rn;
+	struct bgp_dest *dest;
 	struct bgp *bgp;
 	struct bgp_table *table;
 
@@ -409,10 +426,10 @@ static unsigned int bgp_dump_routes_func(int afi, int first_run,
 	/* Walk down each BGP route. */
 	table = bgp->rib[afi][SAFI_UNICAST];
 
-	for (rn = bgp_table_top(table); rn; rn = bgp_route_next(rn)) {
-		path = bgp_node_get_bgp_path_info(rn);
+	for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+		path = bgp_dest_get_bgp_path_info(dest);
 		while (path) {
-			path = bgp_dump_route_node_record(afi, rn, path, seq);
+			path = bgp_dump_route_node_record(afi, dest, path, seq);
 			seq++;
 		}
 	}
@@ -422,11 +439,10 @@ static unsigned int bgp_dump_routes_func(int afi, int first_run,
 	return seq;
 }
 
-static int bgp_dump_interval_func(struct thread *t)
+static void bgp_dump_interval_func(struct thread *t)
 {
 	struct bgp_dump *bgp_dump;
 	bgp_dump = THREAD_ARG(t);
-	bgp_dump->t_interval = NULL;
 
 	/* Reschedule dump even if file couldn't be opened this time... */
 	if (bgp_dump_open_file(bgp_dump) != NULL) {
@@ -446,8 +462,6 @@ static int bgp_dump_interval_func(struct thread *t)
 	/* if interval is set reschedule */
 	if (bgp_dump->interval > 0)
 		bgp_dump_interval_add(bgp_dump, bgp_dump->interval);
-
-	return 0;
 }
 
 /* Dump common information. */
@@ -493,13 +507,13 @@ static void bgp_dump_common(struct stream *obuf, struct peer *peer,
 }
 
 /* Dump BGP status change. */
-void bgp_dump_state(struct peer *peer, int status_old, int status_new)
+int bgp_dump_state(struct peer *peer)
 {
 	struct stream *obuf;
 
 	/* If dump file pointer is disabled return immediately. */
 	if (bgp_dump_all.fp == NULL)
-		return;
+		return 0;
 
 	/* Make dump stream. */
 	obuf = bgp_dump_obuf;
@@ -509,8 +523,8 @@ void bgp_dump_state(struct peer *peer, int status_old, int status_new)
 			bgp_dump_all.type);
 	bgp_dump_common(obuf, peer, 1); /* force this in as4speak*/
 
-	stream_putw(obuf, status_old);
-	stream_putw(obuf, status_new);
+	stream_putw(obuf, peer->ostatus);
+	stream_putw(obuf, peer->status);
 
 	/* Set length. */
 	bgp_dump_set_size(obuf, MSG_PROTOCOL_BGP4MP);
@@ -518,25 +532,39 @@ void bgp_dump_state(struct peer *peer, int status_old, int status_new)
 	/* Write to the stream. */
 	fwrite(STREAM_DATA(obuf), stream_get_endp(obuf), 1, bgp_dump_all.fp);
 	fflush(bgp_dump_all.fp);
+	return 0;
 }
 
 static void bgp_dump_packet_func(struct bgp_dump *bgp_dump, struct peer *peer,
 				 struct stream *packet)
 {
 	struct stream *obuf;
-
+	bool addpath_capable = false;
 	/* If dump file pointer is disabled return immediately. */
 	if (bgp_dump->fp == NULL)
 		return;
+	if (peer->su.sa.sa_family == AF_INET) {
+		addpath_capable =
+			bgp_addpath_encode_rx(peer, AFI_IP, SAFI_UNICAST);
+	} else if (peer->su.sa.sa_family == AF_INET6) {
+		addpath_capable =
+			bgp_addpath_encode_rx(peer, AFI_IP6, SAFI_UNICAST);
+	}
 
 	/* Make dump stream. */
 	obuf = bgp_dump_obuf;
 	stream_reset(obuf);
 
 	/* Dump header and common part. */
-	if (CHECK_FLAG(peer->cap, PEER_CAP_AS4_RCV)) {
+	if (CHECK_FLAG(peer->cap, PEER_CAP_AS4_RCV) && addpath_capable) {
+		bgp_dump_header(obuf, MSG_PROTOCOL_BGP4MP,
+				BGP4MP_MESSAGE_AS4_ADDPATH, bgp_dump->type);
+	} else if (CHECK_FLAG(peer->cap, PEER_CAP_AS4_RCV)) {
 		bgp_dump_header(obuf, MSG_PROTOCOL_BGP4MP, BGP4MP_MESSAGE_AS4,
 				bgp_dump->type);
+	} else if (addpath_capable) {
+		bgp_dump_header(obuf, MSG_PROTOCOL_BGP4MP,
+				BGP4MP_MESSAGE_ADDPATH, bgp_dump->type);
 	} else {
 		bgp_dump_header(obuf, MSG_PROTOCOL_BGP4MP, BGP4MP_MESSAGE,
 				bgp_dump->type);
@@ -555,7 +583,8 @@ static void bgp_dump_packet_func(struct bgp_dump *bgp_dump, struct peer *peer,
 }
 
 /* Called from bgp_packet.c when BGP packet is received. */
-void bgp_dump_packet(struct peer *peer, int type, struct stream *packet)
+static int bgp_dump_packet(struct peer *peer, uint8_t type, bgp_size_t size,
+		struct stream *packet)
 {
 	/* bgp_dump_all. */
 	bgp_dump_packet_func(&bgp_dump_all, peer, packet);
@@ -563,6 +592,7 @@ void bgp_dump_packet(struct peer *peer, int type, struct stream *packet)
 	/* bgp_dump_updates. */
 	if (type == BGP_MSG_UPDATE)
 		bgp_dump_packet_func(&bgp_dump_updates, peer, packet);
+	return 0;
 }
 
 static unsigned int bgp_dump_parse_time(const char *str)
@@ -581,7 +611,7 @@ static unsigned int bgp_dump_parse_time(const char *str)
 	len = strlen(str);
 
 	for (i = 0; i < len; i++) {
-		if (isdigit((int)str[i])) {
+		if (isdigit((unsigned char)str[i])) {
 			time *= 10;
 			time += str[i] - '0';
 		} else if (str[i] == 'H' || str[i] == 'h') {
@@ -663,10 +693,7 @@ static int bgp_dump_set(struct vty *vty, struct bgp_dump *bgp_dump,
 static int bgp_dump_unset(struct bgp_dump *bgp_dump)
 {
 	/* Removing file name. */
-	if (bgp_dump->filename) {
-		XFREE(MTYPE_BGP_DUMP_STR, bgp_dump->filename);
-		bgp_dump->filename = NULL;
-	}
+	XFREE(MTYPE_BGP_DUMP_STR, bgp_dump->filename);
 
 	/* Closing file. */
 	if (bgp_dump->fp) {
@@ -674,19 +701,13 @@ static int bgp_dump_unset(struct bgp_dump *bgp_dump)
 		bgp_dump->fp = NULL;
 	}
 
-	/* Removing interval thread. */
-	if (bgp_dump->t_interval) {
-		thread_cancel(bgp_dump->t_interval);
-		bgp_dump->t_interval = NULL;
-	}
+	/* Removing interval event. */
+	THREAD_OFF(bgp_dump->t_interval);
 
 	bgp_dump->interval = 0;
 
 	/* Removing interval string. */
-	if (bgp_dump->interval_str) {
-		XFREE(MTYPE_BGP_DUMP_STR, bgp_dump->interval_str);
-		bgp_dump->interval_str = NULL;
-	}
+	XFREE(MTYPE_BGP_DUMP_STR, bgp_dump->interval_str);
 
 	return CMD_SUCCESS;
 }
@@ -778,34 +799,14 @@ DEFUN (no_dump_bgp_all,
 	return bgp_dump_unset(bgp_dump_struct);
 }
 
+static int config_write_bgp_dump(struct vty *vty);
 /* BGP node structure. */
-static struct cmd_node bgp_dump_node = {DUMP_NODE, "", 1};
-
-#if 0
-char *
-config_time2str (unsigned int interval)
-{
-  static char buf[BUFSIZ];
-
-  buf[0] = '\0';
-
-  if (interval / 3600)
-    {
-      sprintf (buf, "%dh", interval / 3600);
-      interval %= 3600;
-    }
-  if (interval / 60)
-    {
-      sprintf (buf + strlen (buf), "%dm", interval /60);
-      interval %= 60;
-    }
-  if (interval)
-    {
-      sprintf (buf + strlen (buf), "%d", interval);
-    }
-  return buf;
-}
-#endif
+static struct cmd_node bgp_dump_node = {
+	.name = "dump",
+	.node = DUMP_NODE,
+	.prompt = "",
+	.config_write = config_write_bgp_dump,
+};
 
 static int config_write_bgp_dump(struct vty *vty)
 {
@@ -850,18 +851,21 @@ static int config_write_bgp_dump(struct vty *vty)
 /* Initialize BGP packet dump functionality. */
 void bgp_dump_init(void)
 {
-	memset(&bgp_dump_all, 0, sizeof(struct bgp_dump));
-	memset(&bgp_dump_updates, 0, sizeof(struct bgp_dump));
-	memset(&bgp_dump_routes, 0, sizeof(struct bgp_dump));
+	memset(&bgp_dump_all, 0, sizeof(bgp_dump_all));
+	memset(&bgp_dump_updates, 0, sizeof(bgp_dump_updates));
+	memset(&bgp_dump_routes, 0, sizeof(bgp_dump_routes));
 
 	bgp_dump_obuf =
-		stream_new((BGP_MAX_PACKET_SIZE << 1) + BGP_DUMP_MSG_HEADER
-			   + BGP_DUMP_HEADER_SIZE);
+		stream_new((BGP_STANDARD_MESSAGE_MAX_PACKET_SIZE * 2)
+			   + BGP_DUMP_MSG_HEADER + BGP_DUMP_HEADER_SIZE);
 
-	install_node(&bgp_dump_node, config_write_bgp_dump);
+	install_node(&bgp_dump_node);
 
 	install_element(CONFIG_NODE, &dump_bgp_all_cmd);
 	install_element(CONFIG_NODE, &no_dump_bgp_all_cmd);
+
+	hook_register(bgp_packet_dump, bgp_dump_packet);
+	hook_register(peer_status_changed, bgp_dump_state);
 }
 
 void bgp_dump_finish(void)
@@ -872,4 +876,6 @@ void bgp_dump_finish(void)
 
 	stream_free(bgp_dump_obuf);
 	bgp_dump_obuf = NULL;
+	hook_unregister(bgp_packet_dump, bgp_dump_packet);
+	hook_unregister(peer_status_changed, bgp_dump_state);
 }

@@ -26,10 +26,11 @@
 #include "if.h"
 #include "if_rmap.h"
 
-DEFINE_MTYPE_STATIC(LIB, IF_RMAP_CTX, "Interface route map container")
-DEFINE_MTYPE_STATIC(LIB, IF_RMAP_CTX_NAME, "Interface route map container name")
-DEFINE_MTYPE_STATIC(LIB, IF_RMAP, "Interface route map")
-DEFINE_MTYPE_STATIC(LIB, IF_RMAP_NAME, "I.f. route map name")
+DEFINE_MTYPE_STATIC(LIB, IF_RMAP_CTX, "Interface route map container");
+DEFINE_MTYPE_STATIC(LIB, IF_RMAP_CTX_NAME,
+		    "Interface route map container name");
+DEFINE_MTYPE_STATIC(LIB, IF_RMAP, "Interface route map");
+DEFINE_MTYPE_STATIC(LIB, IF_RMAP_NAME, "I.f. route map name");
 
 static struct list *if_rmap_ctx_list;
 
@@ -107,7 +108,7 @@ static struct if_rmap *if_rmap_get(struct if_rmap_ctx *ctx, const char *ifname)
 	return ret;
 }
 
-static unsigned int if_rmap_hash_make(void *data)
+static unsigned int if_rmap_hash_make(const void *data)
 {
 	const struct if_rmap *if_rmap = data;
 
@@ -164,7 +165,6 @@ static int if_rmap_unset(struct if_rmap_ctx *ctx,
 			return 0;
 
 		XFREE(MTYPE_IF_RMAP_NAME, if_rmap->routemap[IF_RMAP_IN]);
-		if_rmap->routemap[IF_RMAP_IN] = NULL;
 	}
 
 	if (type == IF_RMAP_OUT) {
@@ -174,7 +174,6 @@ static int if_rmap_unset(struct if_rmap_ctx *ctx,
 			return 0;
 
 		XFREE(MTYPE_IF_RMAP_NAME, if_rmap->routemap[IF_RMAP_OUT]);
-		if_rmap->routemap[IF_RMAP_OUT] = NULL;
 	}
 
 	if (ctx->if_rmap_delete_hook)

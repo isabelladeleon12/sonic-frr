@@ -29,6 +29,8 @@
 
 #include "ripd/ripd.h"
 
+DEFINE_MTYPE_STATIC(RIPD, RIP_PEER, "RIP peer");
+
 static struct rip_peer *rip_peer_new(void)
 {
 	return XCALLOC(MTYPE_RIP_PEER, sizeof(struct rip_peer));
@@ -36,7 +38,7 @@ static struct rip_peer *rip_peer_new(void)
 
 static void rip_peer_free(struct rip_peer *peer)
 {
-	RIP_TIMER_OFF(peer->t_timeout);
+	THREAD_OFF(peer->t_timeout);
 	XFREE(MTYPE_RIP_PEER, peer);
 }
 
@@ -65,15 +67,13 @@ struct rip_peer *rip_peer_lookup_next(struct rip *rip, struct in_addr *addr)
 }
 
 /* RIP peer is timeout. */
-static int rip_peer_timeout(struct thread *t)
+static void rip_peer_timeout(struct thread *t)
 {
 	struct rip_peer *peer;
 
 	peer = THREAD_ARG(t);
 	listnode_delete(peer->rip->peer_list, peer);
 	rip_peer_free(peer);
-
-	return 0;
 }
 
 /* Get RIP peer.  At the same time update timeout thread. */
@@ -84,8 +84,7 @@ static struct rip_peer *rip_peer_get(struct rip *rip, struct in_addr *addr)
 	peer = rip_peer_lookup(rip, addr);
 
 	if (peer) {
-		if (peer->t_timeout)
-			thread_cancel(peer->t_timeout);
+		THREAD_OFF(peer->t_timeout);
 	} else {
 		peer = rip_peer_new();
 		peer->rip = rip;
@@ -94,7 +93,6 @@ static struct rip_peer *rip_peer_get(struct rip *rip, struct in_addr *addr)
 	}
 
 	/* Update timeout thread. */
-	peer->t_timeout = NULL;
 	thread_add_timer(master, rip_peer_timeout, peer, RIP_PEER_TIMER_DEFAULT,
 			 &peer->t_timeout);
 
@@ -129,7 +127,6 @@ void rip_peer_bad_packet(struct rip *rip, struct sockaddr_in *from)
 static char *rip_peer_uptime(struct rip_peer *peer, char *buf, size_t len)
 {
 	time_t uptime;
-	struct tm *tm;
 
 	/* If there is no connection has been done before print `never'. */
 	if (peer->uptime == 0) {
@@ -140,17 +137,9 @@ static char *rip_peer_uptime(struct rip_peer *peer, char *buf, size_t len)
 	/* Get current time. */
 	uptime = time(NULL);
 	uptime -= peer->uptime;
-	tm = gmtime(&uptime);
 
-	if (uptime < ONE_DAY_SECOND)
-		snprintf(buf, len, "%02d:%02d:%02d", tm->tm_hour, tm->tm_min,
-			 tm->tm_sec);
-	else if (uptime < ONE_WEEK_SECOND)
-		snprintf(buf, len, "%dd%02dh%02dm", tm->tm_yday, tm->tm_hour,
-			 tm->tm_min);
-	else
-		snprintf(buf, len, "%02dw%dd%02dh", tm->tm_yday / 7,
-			 tm->tm_yday - ((tm->tm_yday / 7) * 7), tm->tm_hour);
+	frrtime_to_interval(uptime, buf, len);
+
 	return buf;
 }
 
@@ -162,8 +151,8 @@ void rip_peer_display(struct vty *vty, struct rip *rip)
 	char timebuf[RIP_UPTIME_LEN];
 
 	for (ALL_LIST_ELEMENTS(rip->peer_list, node, nnode, peer)) {
-		vty_out(vty, "    %-16s %9d %9d %9d   %s\n",
-			inet_ntoa(peer->addr), peer->recv_badpackets,
+		vty_out(vty, "    %-16pI4 %9d %9d %9d   %s\n",
+			&peer->addr, peer->recv_badpackets,
 			peer->recv_badroutes, ZEBRA_RIP_DISTANCE_DEFAULT,
 			rip_peer_uptime(peer, timebuf, RIP_UPTIME_LEN));
 	}

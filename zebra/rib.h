@@ -23,7 +23,9 @@
 #define _ZEBRA_RIB_H
 
 #include "zebra.h"
+#include "memory.h"
 #include "hook.h"
+#include "typesafe.h"
 #include "linklist.h"
 #include "prefix.h"
 #include "table.h"
@@ -34,21 +36,82 @@
 #include "if.h"
 #include "mpls.h"
 #include "srcdest_table.h"
+#include "zebra/zebra_nhg.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+DECLARE_MGROUP(ZEBRA);
+
+DECLARE_MTYPE(RE);
+
+PREDECL_LIST(rnh_list);
+
+/* Nexthop structure. */
+struct rnh {
+	uint8_t flags;
+
+#define ZEBRA_NHT_CONNECTED 0x1
+#define ZEBRA_NHT_DELETED 0x2
+#define ZEBRA_NHT_RESOLVE_VIA_DEFAULT 0x4
+
+	/* VRF identifier. */
+	vrf_id_t vrf_id;
+
+	afi_t afi;
+	safi_t safi;
+
+	uint32_t seqno;
+
+	struct route_entry *state;
+	struct prefix resolved_route;
+	struct list *client_list;
+
+	/* pseudowires dependent on this nh */
+	struct list *zebra_pseudowire_list;
+
+	struct route_node *node;
+
+	/*
+	 * if this has been filtered for the client
+	 */
+	int filtered[ZEBRA_ROUTE_MAX];
+
+	struct rnh_list_item rnh_list_item;
+};
+
 #define DISTANCE_INFINITY  255
 #define ZEBRA_KERNEL_TABLE_MAX 252 /* support for no more than this rt tables */
 
+PREDECL_LIST(re_list);
+
+struct re_opaque {
+	uint16_t length;
+	uint8_t data[];
+};
+
 struct route_entry {
 	/* Link list. */
-	struct route_entry *next;
-	struct route_entry *prev;
+	struct re_list_item next;
 
-	/* Nexthop structure */
-	struct nexthop_group ng;
+	/* Nexthop group, shared/refcounted, based on the nexthop(s)
+	 * provided by the owner of the route
+	 */
+	struct nhg_hash_entry *nhe;
+
+	/* Nexthop group from FIB (optional), reflecting what is actually
+	 * installed in the FIB if that differs. The 'backup' group is used
+	 * when backup nexthops are present in the route's nhg.
+	 */
+	struct nexthop_group fib_ng;
+	struct nexthop_group fib_backup_ng;
+
+	/* Nexthop group hash entry IDs. The "installed" id is the id
+	 * used in linux/netlink, if available.
+	 */
+	uint32_t nhe_id;
+	uint32_t nhe_installed_id;
 
 	/* Tag */
 	route_tag_t tag;
@@ -56,11 +119,8 @@ struct route_entry {
 	/* Uptime. */
 	time_t uptime;
 
-	/* Type fo this route. */
+	/* Type of this route. */
 	int type;
-
-	/* Source protocol instance */
-	unsigned short instance;
 
 	/* VRF identifier. */
 	vrf_id_t vrf_id;
@@ -75,9 +135,6 @@ struct route_entry {
 	uint32_t mtu;
 	uint32_t nexthop_mtu;
 
-	/* Distance. */
-	uint8_t distance;
-
 	/* Flags of this route.
 	 * This flag's definition is in lib/zebra.h ZEBRA_FLAG_* and is exposed
 	 * to clients via Zserv
@@ -87,35 +144,51 @@ struct route_entry {
 	/* RIB internal status */
 	uint32_t status;
 #define ROUTE_ENTRY_REMOVED          0x1
-/* to simplify NHT logic when NHs change, instead of doing a NH by NH cmp */
-#define ROUTE_ENTRY_NEXTHOPS_CHANGED 0x2
 /* The Route Entry has changed */
-#define ROUTE_ENTRY_CHANGED          0x4
+#define ROUTE_ENTRY_CHANGED          0x2
 /* The Label has changed on the Route entry */
-#define ROUTE_ENTRY_LABELS_CHANGED   0x8
+#define ROUTE_ENTRY_LABELS_CHANGED   0x4
 /* Route is queued for Installation into the Data Plane */
-#define ROUTE_ENTRY_QUEUED   0x10
+#define ROUTE_ENTRY_QUEUED   0x8
 /* Route is installed into the Data Plane */
-#define ROUTE_ENTRY_INSTALLED        0x20
+#define ROUTE_ENTRY_INSTALLED        0x10
 /* Route has Failed installation into the Data Plane in some manner */
-#define ROUTE_ENTRY_FAILED           0x40
-
-	/* Nexthop information. */
-	uint8_t nexthop_num;
-	uint8_t nexthop_active_num;
+#define ROUTE_ENTRY_FAILED           0x20
+/* Route has a 'fib' set of nexthops, probably because the installed set
+ * differs from the rib/normal set of nexthops.
+ */
+#define ROUTE_ENTRY_USE_FIB_NHG      0x40
 
 	/* Sequence value incremented for each dataplane operation */
 	uint32_t dplane_sequence;
+
+	/* Source protocol instance */
+	uint16_t instance;
+
+	/* Distance. */
+	uint8_t distance;
+
+	struct re_opaque *opaque;
 };
 
+#define RIB_SYSTEM_ROUTE(R) RSYSTEM_ROUTE((R)->type)
+
+#define RIB_KERNEL_ROUTE(R) RKERNEL_ROUTE((R)->type)
+
 /* meta-queue structure:
- * sub-queue 0: connected, kernel
- * sub-queue 1: static
- * sub-queue 2: RIP, RIPng, OSPF, OSPF6, IS-IS, EIGRP, NHRP
- * sub-queue 3: iBGP, eBGP
- * sub-queue 4: any other origin (if any)
+ * sub-queue 0: nexthop group objects
+ * sub-queue 1: EVPN/VxLAN objects
+ * sub-queue 2: Early Route Processing
+ * sub-queue 3: Early Label Processing
+ * sub-queue 4: connected
+ * sub-queue 5: kernel
+ * sub-queue 6: static
+ * sub-queue 7: RIP, RIPng, OSPF, OSPF6, IS-IS, EIGRP, NHRP
+ * sub-queue 8: iBGP, eBGP
+ * sub-queue 9: any other origin (if any) typically those that
+ *              don't generate routes
  */
-#define MQ_SIZE 5
+#define MQ_SIZE 10
 struct meta_queue {
 	struct list *subq[MQ_SIZE];
 	uint32_t size; /* sum of lengths of all subqueues */
@@ -135,7 +208,7 @@ typedef struct rib_dest_t_ {
 	/*
 	 * Doubly-linked list of routes for this prefix.
 	 */
-	struct route_entry *routes;
+	struct re_list_head routes;
 
 	struct route_entry *selected_fib;
 
@@ -151,7 +224,7 @@ typedef struct rib_dest_t_ {
 	 * the data plane we will run evaluate_rnh
 	 * on these prefixes.
 	 */
-	struct list *nht;
+	struct rnh_list_head nht;
 
 	/*
 	 * Linkage to put dest on the FPM processing queue.
@@ -160,9 +233,12 @@ typedef struct rib_dest_t_ {
 
 } rib_dest_t;
 
+DECLARE_LIST(rnh_list, struct rnh, rnh_list_item);
+DECLARE_LIST(re_list, struct route_entry, next);
+
 #define RIB_ROUTE_QUEUED(x)	(1 << (x))
 // If MQ_SIZE is modified this value needs to be updated.
-#define RIB_ROUTE_ANY_QUEUED    0x1F
+#define RIB_ROUTE_ANY_QUEUED 0x3F
 
 /*
  * The maximum qindex that can be used.
@@ -187,14 +263,22 @@ typedef struct rib_dest_t_ {
  * Macro to iterate over each route for a destination (prefix).
  */
 #define RE_DEST_FOREACH_ROUTE(dest, re)                                        \
-	for ((re) = (dest) ? (dest)->routes : NULL; (re); (re) = (re)->next)
+	for ((re) = (dest) ? re_list_first(&((dest)->routes)) : NULL; (re);    \
+	     (re) = re_list_next(&((dest)->routes), (re)))
 
 /*
  * Same as above, but allows the current node to be unlinked.
  */
 #define RE_DEST_FOREACH_ROUTE_SAFE(dest, re, next)                             \
-	for ((re) = (dest) ? (dest)->routes : NULL;                            \
-	     (re) && ((next) = (re)->next, 1); (re) = (next))
+	for ((re) = (dest) ? re_list_first(&((dest)->routes)) : NULL;          \
+	     (re) && ((next) = re_list_next(&((dest)->routes), (re)), 1);      \
+	     (re) = (next))
+
+#define RE_DEST_FIRST_ROUTE(dest, re)                                          \
+	((re) = (dest) ? re_list_first(&((dest)->routes)) : NULL)
+
+#define RE_DEST_NEXT_ROUTE(dest, re)                                           \
+	((re) = (dest) ? re_list_next(&((dest)->routes), (re)) : NULL)
 
 #define RNODE_FOREACH_RE(rn, re)                                               \
 	RE_DEST_FOREACH_ROUTE (rib_dest_from_rnode(rn), re)
@@ -202,18 +286,9 @@ typedef struct rib_dest_t_ {
 #define RNODE_FOREACH_RE_SAFE(rn, re, next)                                    \
 	RE_DEST_FOREACH_ROUTE_SAFE (rib_dest_from_rnode(rn), re, next)
 
-#if defined(HAVE_RTADV)
-/* Structure which hold status of router advertisement. */
-struct rtadv {
-	int sock;
+#define RNODE_FIRST_RE(rn, re) RE_DEST_FIRST_ROUTE(rib_dest_from_rnode(rn), re)
 
-	int adv_if_count;
-	int adv_msec_if_count;
-
-	struct thread *ra_read;
-	struct thread *ra_timer;
-};
-#endif /* HAVE_RTADV */
+#define RNODE_NEXT_RE(rn, re) RE_DEST_NEXT_ROUTE(rib_dest_from_rnode(rn), re)
 
 /*
  * rib_table_info_t
@@ -221,7 +296,7 @@ struct rtadv {
  * Structure that is hung off of a route_table that holds information about
  * the table.
  */
-typedef struct rib_table_info_t_ {
+struct rib_table_info {
 
 	/*
 	 * Back pointer to zebra_vrf.
@@ -229,14 +304,14 @@ typedef struct rib_table_info_t_ {
 	struct zebra_vrf *zvrf;
 	afi_t afi;
 	safi_t safi;
+	uint32_t table_id;
+};
 
-} rib_table_info_t;
-
-typedef enum {
+enum rib_tables_iter_state {
 	RIB_TABLES_ITER_S_INIT,
 	RIB_TABLES_ITER_S_ITERATING,
 	RIB_TABLES_ITER_S_DONE
-} rib_tables_iter_state_t;
+};
 
 /*
  * Structure that holds state for iterating over all tables in the
@@ -246,64 +321,34 @@ typedef struct rib_tables_iter_t_ {
 	vrf_id_t vrf_id;
 	int afi_safi_ix;
 
-	rib_tables_iter_state_t state;
+	enum rib_tables_iter_state state;
 } rib_tables_iter_t;
 
 /* Events/reasons triggering a RIB update. */
-typedef enum {
-	RIB_UPDATE_IF_CHANGE,
+enum rib_update_event {
+	RIB_UPDATE_KERNEL,
 	RIB_UPDATE_RMAP_CHANGE,
-	RIB_UPDATE_OTHER
-} rib_update_event_t;
+	RIB_UPDATE_OTHER,
+	RIB_UPDATE_MAX
+};
 
-extern struct nexthop *route_entry_nexthop_ifindex_add(struct route_entry *re,
-						       ifindex_t ifindex,
-						       vrf_id_t nh_vrf_id);
-extern struct nexthop *
-route_entry_nexthop_blackhole_add(struct route_entry *re,
-				  enum blackhole_type bh_type);
-extern struct nexthop *route_entry_nexthop_ipv4_add(struct route_entry *re,
-						    struct in_addr *ipv4,
-						    struct in_addr *src,
-						    vrf_id_t nh_vrf_id);
-extern struct nexthop *
-route_entry_nexthop_ipv4_ifindex_add(struct route_entry *re,
-				     struct in_addr *ipv4, struct in_addr *src,
-				     ifindex_t ifindex, vrf_id_t nh_vrf_id);
-extern void route_entry_nexthop_delete(struct route_entry *re,
-				       struct nexthop *nexthop);
-extern struct nexthop *route_entry_nexthop_ipv6_add(struct route_entry *re,
-						    struct in6_addr *ipv6,
-						    vrf_id_t nh_vrf_id);
-extern struct nexthop *
-route_entry_nexthop_ipv6_ifindex_add(struct route_entry *re,
-				     struct in6_addr *ipv6, ifindex_t ifindex,
-				     vrf_id_t nh_vrf_id);
-extern void route_entry_nexthop_add(struct route_entry *re,
-				    struct nexthop *nexthop);
-extern void route_entry_copy_nexthops(struct route_entry *re,
-				      struct nexthop *nh);
+int route_entry_update_nhe(struct route_entry *re,
+			   struct nhg_hash_entry *new_nhghe);
+
+/* NHG replace has happend, we have to update route_entry pointers to new one */
+void rib_handle_nhg_replace(struct nhg_hash_entry *old_entry,
+			    struct nhg_hash_entry *new_entry);
 
 #define route_entry_dump(prefix, src, re) _route_entry_dump(__func__, prefix, src, re)
 extern void _route_entry_dump(const char *func, union prefixconstptr pp,
 			      union prefixconstptr src_pp,
 			      const struct route_entry *re);
-/* RPF lookup behaviour */
-enum multicast_mode {
-	MCAST_NO_CONFIG = 0,  /* MIX_MRIB_FIRST, but no show in config write */
-	MCAST_MRIB_ONLY,      /* MRIB only */
-	MCAST_URIB_ONLY,      /* URIB only */
-	MCAST_MIX_MRIB_FIRST, /* MRIB, if nothing at all then URIB */
-	MCAST_MIX_DISTANCE,   /* MRIB & URIB, lower distance wins */
-	MCAST_MIX_PFXLEN,     /* MRIB & URIB, longer prefix wins */
-			      /* on equal value, MRIB wins for last 2 */
-};
 
-extern void multicast_mode_ipv4_set(enum multicast_mode mode);
-extern enum multicast_mode multicast_mode_ipv4_get(void);
-
-extern void rib_lookup_and_dump(struct prefix_ipv4 *p, vrf_id_t vrf_id);
-extern void rib_lookup_and_pushup(struct prefix_ipv4 *p, vrf_id_t vrf_id);
+struct route_entry *
+zebra_rib_route_entry_new(vrf_id_t vrf_id, int type, uint8_t instance,
+			  uint32_t flags, uint32_t nhe_id, uint32_t table_id,
+			  uint32_t metric, uint32_t mtu, uint8_t distance,
+			  route_tag_t tag);
 
 #define ZEBRA_RIB_LOOKUP_ERROR -1
 #define ZEBRA_RIB_FOUND_EXACT 0
@@ -324,34 +369,51 @@ extern void rib_uninstall_kernel(struct route_node *rn, struct route_entry *re);
  * All rib_add function will not just add prefix into RIB, but
  * also implicitly withdraw equal prefix of same type. */
 extern int rib_add(afi_t afi, safi_t safi, vrf_id_t vrf_id, int type,
-		   unsigned short instance, int flags, struct prefix *p,
+		   unsigned short instance, uint32_t flags, struct prefix *p,
 		   struct prefix_ipv6 *src_p, const struct nexthop *nh,
-		   uint32_t table_id, uint32_t metric, uint32_t mtu,
-		   uint8_t distance, route_tag_t tag);
-
+		   uint32_t nhe_id, uint32_t table_id, uint32_t metric,
+		   uint32_t mtu, uint8_t distance, route_tag_t tag,
+		   bool startup);
+/*
+ * Multipath route apis.
+ */
 extern int rib_add_multipath(afi_t afi, safi_t safi, struct prefix *p,
-			     struct prefix_ipv6 *src_p, struct route_entry *re);
+			     struct prefix_ipv6 *src_p, struct route_entry *re,
+			     struct nexthop_group *ng, bool startup);
+/*
+ * -1 -> some sort of error
+ *  0 -> an add
+ *  1 -> an update
+ */
+extern int rib_add_multipath_nhe(afi_t afi, safi_t safi, struct prefix *p,
+				 struct prefix_ipv6 *src_p,
+				 struct route_entry *re,
+				 struct nhg_hash_entry *nhe, bool startup);
 
 extern void rib_delete(afi_t afi, safi_t safi, vrf_id_t vrf_id, int type,
-		       unsigned short instance, int flags, struct prefix *p,
-		       struct prefix_ipv6 *src_p, const struct nexthop *nh,
+		       unsigned short instance, uint32_t flags,
+		       struct prefix *p, struct prefix_ipv6 *src_p,
+		       const struct nexthop *nh, uint32_t nhe_id,
 		       uint32_t table_id, uint32_t metric, uint8_t distance,
 		       bool fromkernel);
 
 extern struct route_entry *rib_match(afi_t afi, safi_t safi, vrf_id_t vrf_id,
-				     union g_addr *addr,
+				     const union g_addr *addr,
 				     struct route_node **rn_out);
 extern struct route_entry *rib_match_ipv4_multicast(vrf_id_t vrf_id,
 						    struct in_addr addr,
+						    struct route_node **rn_out);
+extern struct route_entry *rib_match_ipv6_multicast(vrf_id_t vrf_id,
+						    struct in6_addr addr,
 						    struct route_node **rn_out);
 
 extern struct route_entry *rib_lookup_ipv4(struct prefix_ipv4 *p,
 					   vrf_id_t vrf_id);
 
-extern void rib_update(vrf_id_t vrf_id, rib_update_event_t event);
+extern void rib_update(enum rib_update_event event);
 extern void rib_update_table(struct route_table *table,
-			     rib_update_event_t event);
-extern void rib_sweep_route(void);
+			     enum rib_update_event event, int rtype);
+extern void rib_sweep_route(struct thread *t);
 extern void rib_sweep_table(struct route_table *table);
 extern void rib_close_table(struct route_table *table);
 extern void rib_init(void);
@@ -359,8 +421,48 @@ extern unsigned long rib_score_proto(uint8_t proto, unsigned short instance);
 extern unsigned long rib_score_proto_table(uint8_t proto,
 					   unsigned short instance,
 					   struct route_table *table);
-extern void rib_queue_add(struct route_node *rn);
-extern void meta_queue_free(struct meta_queue *mq);
+
+extern int rib_queue_add(struct route_node *rn);
+
+struct nhg_ctx; /* Forward declaration */
+
+/* Enqueue incoming nhg from OS for processing */
+extern int rib_queue_nhg_ctx_add(struct nhg_ctx *ctx);
+
+/* Enqueue incoming nhg from proto daemon for processing */
+extern int rib_queue_nhe_add(struct nhg_hash_entry *nhe);
+
+/* Enqueue evpn route for processing */
+int zebra_rib_queue_evpn_route_add(vrf_id_t vrf_id, const struct ethaddr *rmac,
+				   const struct ipaddr *vtep_ip,
+				   const struct prefix *host_prefix);
+int zebra_rib_queue_evpn_route_del(vrf_id_t vrf_id,
+				   const struct ipaddr *vtep_ip,
+				   const struct prefix *host_prefix);
+/* Enqueue EVPN remote ES for processing */
+int zebra_rib_queue_evpn_rem_es_add(const esi_t *esi,
+				    const struct in_addr *vtep_ip,
+				    bool esr_rxed, uint8_t df_alg,
+				    uint16_t df_pref);
+int zebra_rib_queue_evpn_rem_es_del(const esi_t *esi,
+				    const struct in_addr *vtep_ip);
+/* Enqueue EVPN remote macip update for processing */
+int zebra_rib_queue_evpn_rem_macip_del(vni_t vni, const struct ethaddr *macaddr,
+				       const struct ipaddr *ip,
+				       struct in_addr vtep_ip);
+int zebra_rib_queue_evpn_rem_macip_add(vni_t vni, const struct ethaddr *macaddr,
+				       const struct ipaddr *ipaddr,
+				       uint8_t flags, uint32_t seq,
+				       struct in_addr vtep_ip,
+				       const esi_t *esi);
+/* Enqueue VXLAN remote vtep update for processing */
+int zebra_rib_queue_evpn_rem_vtep_add(vrf_id_t vrf_id, vni_t vni,
+				      struct in_addr vtep_ip,
+				      int flood_control);
+int zebra_rib_queue_evpn_rem_vtep_del(vrf_id_t vrf_id, vni_t vni,
+				      struct in_addr vtep_ip);
+
+extern void meta_queue_free(struct meta_queue *mq, struct zebra_vrf *zvrf);
 extern int zebra_rib_labeled_unicast(struct route_entry *re);
 extern struct route_table *rib_table_ipv6;
 
@@ -370,7 +472,11 @@ extern struct route_table *rib_tables_iter_next(rib_tables_iter_t *iter);
 
 extern uint8_t route_distance(int type);
 
-extern void zebra_rib_evaluate_rn_nexthops(struct route_node *rn, uint32_t seq);
+extern void zebra_rib_evaluate_rn_nexthops(struct route_node *rn, uint32_t seq,
+					   bool rt_delete);
+
+extern struct route_node *
+rib_find_rn_from_ctx(const struct zebra_dplane_ctx *ctx);
 
 /*
  * Inline functions.
@@ -379,9 +485,9 @@ extern void zebra_rib_evaluate_rn_nexthops(struct route_node *rn, uint32_t seq);
 /*
  * rib_table_info
  */
-static inline rib_table_info_t *rib_table_info(struct route_table *table)
+static inline struct rib_table_info *rib_table_info(struct route_table *table)
 {
-	return (rib_table_info_t *)route_table_get_info(table);
+	return (struct rib_table_info *)route_table_get_info(table);
 }
 
 /*
@@ -406,7 +512,7 @@ static inline struct route_entry *rnode_to_ribs(struct route_node *rn)
 	if (!dest)
 		return NULL;
 
-	return dest->routes;
+	return re_list_first(&dest->routes);
 }
 
 /*
@@ -461,7 +567,7 @@ static inline void rib_tables_iter_init(rib_tables_iter_t *iter)
 /*
  * rib_tables_iter_started
  *
- * Returns TRUE if this iterator has started iterating over the set of
+ * Returns true if this iterator has started iterating over the set of
  * tables.
  */
 static inline int rib_tables_iter_started(rib_tables_iter_t *iter)
@@ -478,8 +584,33 @@ static inline void rib_tables_iter_cleanup(rib_tables_iter_t *iter)
 }
 
 DECLARE_HOOK(rib_update, (struct route_node * rn, const char *reason),
-	     (rn, reason))
+	     (rn, reason));
+DECLARE_HOOK(rib_shutdown, (struct route_node * rn), (rn));
 
+/*
+ * Access installed/fib nexthops, which may be a subset of the
+ * rib nexthops.
+ */
+static inline struct nexthop_group *rib_get_fib_nhg(struct route_entry *re)
+{
+	/* If the fib set is a subset of the active rib set,
+	 * use the dedicated fib list.
+	 */
+	if (CHECK_FLAG(re->status, ROUTE_ENTRY_USE_FIB_NHG))
+		return &(re->fib_ng);
+	else
+		return &(re->nhe->nhg);
+}
+
+/*
+ * Access backup nexthop-group that represents the installed backup nexthops;
+ * any installed backup will be on the fib list.
+ */
+static inline struct nexthop_group *rib_get_fib_backup_nhg(
+	struct route_entry *re)
+{
+	return &(re->fib_backup_ng);
+}
 
 extern void zebra_vty_init(void);
 

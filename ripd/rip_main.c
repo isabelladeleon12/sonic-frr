@@ -25,7 +25,6 @@
 #include "thread.h"
 #include "command.h"
 #include "memory.h"
-#include "memory_vty.h"
 #include "prefix.h"
 #include "filter.h"
 #include "keychain.h"
@@ -36,15 +35,14 @@
 #include "vrf.h"
 #include "if_rmap.h"
 #include "libfrr.h"
+#include "routemap.h"
 
 #include "ripd/ripd.h"
+#include "ripd/rip_nb.h"
 #include "ripd/rip_errors.h"
 
 /* ripd options. */
-#if CONFDATE > 20190521
-	CPP_NOTICE("-r / --retain has reached deprecation EOL, remove")
-#endif
-static struct option longopts[] = {{"retain", no_argument, NULL, 'r'}, {0}};
+static struct option longopts[] = {{0}};
 
 /* ripd privileges */
 zebra_capabilities_t _caps_p[] = {ZCAP_NET_RAW, ZCAP_BIND, ZCAP_SYS_ADMIN};
@@ -96,7 +94,7 @@ static void sigusr1(void)
 	zlog_rotate();
 }
 
-static struct quagga_signal_t ripd_signals[] = {
+static struct frr_signal_t ripd_signals[] = {
 	{
 		.signal = SIGHUP,
 		.handler = &sighup,
@@ -115,9 +113,12 @@ static struct quagga_signal_t ripd_signals[] = {
 	},
 };
 
-static const struct frr_yang_module_info *ripd_yang_modules[] = {
+static const struct frr_yang_module_info *const ripd_yang_modules[] = {
+	&frr_filter_info,
 	&frr_interface_info,
 	&frr_ripd_info,
+	&frr_route_map_info,
+	&frr_vrf_info,
 };
 
 FRR_DAEMON_INFO(ripd, RIP, .vty_port = RIP_VTY_PORT,
@@ -127,12 +128,10 @@ FRR_DAEMON_INFO(ripd, RIP, .vty_port = RIP_VTY_PORT,
 		.signals = ripd_signals, .n_signals = array_size(ripd_signals),
 
 		.privs = &ripd_privs, .yang_modules = ripd_yang_modules,
-		.n_yang_modules = array_size(ripd_yang_modules), )
+		.n_yang_modules = array_size(ripd_yang_modules),
+);
 
-#if CONFDATE > 20190521
-CPP_NOTICE("-r / --retain has reached deprecation EOL, remove")
-#endif
-#define DEPRECATED_OPTIONS "r"
+#define DEPRECATED_OPTIONS ""
 
 /* Main routine of ripd. */
 int main(int argc, char **argv)
@@ -162,7 +161,6 @@ int main(int argc, char **argv)
 			break;
 		default:
 			frr_help_exit(1);
-			break;
 		}
 	}
 
@@ -184,5 +182,5 @@ int main(int argc, char **argv)
 	frr_run(master);
 
 	/* Not reached. */
-	return (0);
+	return 0;
 }

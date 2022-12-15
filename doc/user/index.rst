@@ -22,12 +22,15 @@ Basics
    :maxdepth: 2
 
    basic
+   extlog
    vtysh
+   grpc
    filter
    routemap
    ipv6
    kernel
    snmp
+   scripting
 .. modules
 
 #########
@@ -49,13 +52,18 @@ Protocols
    nhrpd
    ospfd
    ospf6d
+   pathd
    pim
+   pimv6
    pbr
    ripd
    ripngd
    sharp
    static
    vnc
+   vrrp
+   bmp
+   watchfrr
 
 ########
 Appendix
@@ -68,6 +76,7 @@ Appendix
    bugs
    packet-dumps
    glossary
+   frr-reload
 
 ################
 Copyright notice

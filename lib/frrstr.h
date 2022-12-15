@@ -22,7 +22,12 @@
 #define _FRRSTR_H_
 
 #include <sys/types.h>
+#include <sys/types.h>
+#ifdef HAVE_LIBPCREPOSIX
+#include <pcreposix.h>
+#else
 #include <regex.h>
+#endif /* HAVE_LIBPCREPOSIX */
 #include <stdbool.h>
 
 #include "vector.h"
@@ -88,6 +93,29 @@ void frrstr_filter_vec(vector v, regex_t *filter);
 void frrstr_strvec_free(vector v);
 
 /*
+ * Given a string, replaces all occurrences of a substring with a different
+ * string. The result is a new string. The original string is not modified.
+ *
+ * If 'replace' is longer than 'find', this function performs N+1 allocations,
+ * where N is the number of times 'find' occurs in 'str'. If 'replace' is equal
+ * in length or shorter than 'find', only 1 allocation is performed.
+ *
+ * str
+ *    String to perform replacement on.
+ *
+ * find
+ *    Substring to replace.
+ *
+ * replace
+ *    String to replace 'find' with.
+ *
+ * Returns:
+ *    A new string, allocated with MTYPE_TMP, that is the result of performing
+ *    the replacement on 'str'. This must be freed by the caller.
+ */
+char *frrstr_replace(const char *str, const char *find, const char *replace);
+
+/*
  * Prefix match for string.
  *
  * str
@@ -97,9 +125,23 @@ void frrstr_strvec_free(vector v);
  *    prefix to look for
  *
  * Returns:
- *   true str starts with prefix, false otherwise
+ *   true if str starts with prefix, false otherwise
  */
-bool begins_with(const char *str, const char *prefix);
+bool frrstr_startswith(const char *str, const char *prefix);
+
+/*
+ * Suffix match for string.
+ *
+ * str
+ *    string to check for suffix match
+ *
+ * suffix
+ *    suffix to look for
+ *
+ * Returns:
+ *   true if str ends with suffix, false otherwise
+ */
+bool frrstr_endswith(const char *str, const char *suffix);
 
 /*
  * Check the string only contains digit characters.
@@ -111,6 +153,26 @@ bool begins_with(const char *str, const char *prefix);
  *    1 str only contains digit characters, 0 otherwise
  */
 int all_digit(const char *str);
+
+/*
+ * Copy the hexadecimal representation of the string to a buffer.
+ *
+ * buff
+ *    Buffer to copy result into with size of at least (2 * num) + 1.
+ *
+ * bufsiz
+ *    Size of destination buffer.
+ *
+ * str
+ *    String to represent as hexadecimal.
+ *
+ * num
+ *    Number of characters to copy.
+ *
+ * Returns:
+ *    Pointer to buffer containing resulting hexadecimal representation.
+ */
+char *frrstr_hex(char *buff, size_t bufsiz, const uint8_t *str, size_t num);
 
 #ifdef __cplusplus
 }

@@ -21,6 +21,14 @@
 #define __STATIC_ROUTES_H__
 
 #include "lib/mpls.h"
+#include "table.h"
+#include "memory.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+DECLARE_MGROUP(STATIC);
 
 /* Static route label information */
 struct static_nh_label {
@@ -35,34 +43,87 @@ enum static_blackhole_type {
 	STATIC_BLACKHOLE_REJECT
 };
 
-typedef enum {
-	STATIC_IFNAME,
+/*
+ * The order for below macros should be in sync with
+ * yang model typedef nexthop-type
+ */
+enum static_nh_type {
+	STATIC_IFNAME = 1,
 	STATIC_IPV4_GATEWAY,
 	STATIC_IPV4_GATEWAY_IFNAME,
-	STATIC_BLACKHOLE,
 	STATIC_IPV6_GATEWAY,
 	STATIC_IPV6_GATEWAY_IFNAME,
-} static_types;
+	STATIC_BLACKHOLE,
+};
+
+/*
+ * Route Creation gives us:
+ *  START -> Initial State, only exit is when we send the route to
+ *          zebra for installation
+ * When we send the route to Zebra move to SENT_TO_ZEBRA
+ *  SENT_TO_ZEBRA -> A way to notice that we've sent the route to zebra
+ *                   But have not received a response on it's status yet
+ * After The response from zebra we move to INSTALLED or FAILED
+ *  INSTALLED -> Route was accepted
+ *  FAILED -> Route was rejected
+ * When we receive notification about a nexthop that a route uses
+ * We move the route back to START and initiate the process again.
+ */
+enum static_install_states {
+	STATIC_START,
+	STATIC_SENT_TO_ZEBRA,
+	STATIC_INSTALLED,
+	STATIC_NOT_INSTALLED,
+};
+
+PREDECL_DLIST(static_path_list);
+PREDECL_DLIST(static_nexthop_list);
+
+/* Static route information */
+struct static_route_info {
+	struct static_vrf *svrf;
+	safi_t safi;
+	/* path list */
+	struct static_path_list_head path_list;
+};
+
+/* Static path information */
+struct static_path {
+	/* Route node back pointer. */
+	struct route_node *rn;
+	/* Linkage for static path lists */
+	struct static_path_list_item list;
+	/* Administrative distance. */
+	uint8_t distance;
+	/* Tag */
+	route_tag_t tag;
+	/* Table-id */
+	uint32_t table_id;
+	/* Nexthop list */
+	struct static_nexthop_list_head nexthop_list;
+};
+
+DECLARE_DLIST(static_path_list, struct static_path, list);
 
 /* Static route information. */
-struct static_route {
+struct static_nexthop {
+	/* Path back pointer. */
+	struct static_path *pn;
 	/* For linked list. */
-	struct static_route *prev;
-	struct static_route *next;
+	struct static_nexthop_list_item list;
 
 	/* VRF identifier. */
-	vrf_id_t vrf_id;
 	vrf_id_t nh_vrf_id;
 	char nh_vrfname[VRF_NAMSIZ + 1];
 
-	/* Administrative distance. */
-	uint8_t distance;
-
-	/* Tag */
-	route_tag_t tag;
+	/*
+	 * States that we walk the route through
+	 * To know where we are.
+	 */
+	enum static_install_states state;
 
 	/* Flag for this static route's type. */
-	static_types type;
+	enum static_nh_type type;
 
 	/*
 	 * Nexthop value.
@@ -78,42 +139,87 @@ struct static_route {
 	/* Label information */
 	struct static_nh_label snh_label;
 
-	uint32_t table_id;
-
 	/*
 	 * Whether to pretend the nexthop is directly attached to the specified
 	 * link. Only meaningful when both a gateway address and interface name
 	 * are specified.
 	 */
 	bool onlink;
+
+	/* SR-TE color */
+	uint32_t color;
 };
 
+DECLARE_DLIST(static_nexthop_list, struct static_nexthop, list);
+
+
+/*
+ * rib_dest_from_rnode
+ */
+static inline struct static_route_info *
+static_route_info_from_rnode(struct route_node *rn)
+{
+	return (struct static_route_info *)(rn->info);
+}
+
 extern bool mpls_enabled;
+extern uint32_t zebra_ecmp_count;
 
 extern struct zebra_privs_t static_privs;
 
 void static_fixup_vrf_ids(struct static_vrf *svrf);
 
-extern int static_add_route(afi_t afi, safi_t safi, uint8_t type,
-			    struct prefix *p, struct prefix_ipv6 *src_p,
-			    union g_addr *gate, const char *ifname,
-			    enum static_blackhole_type bh_type, route_tag_t tag,
-			    uint8_t distance, struct static_vrf *svrf,
-			    struct static_vrf *nh_svrf,
-			    struct static_nh_label *snh_label,
-			    uint32_t table_id, bool onlink);
+extern struct static_nexthop *
+static_add_nexthop(struct static_path *pn, enum static_nh_type type,
+		   struct ipaddr *ipaddr, const char *ifname,
+		   const char *nh_vrf, uint32_t color);
+extern void static_install_nexthop(struct static_nexthop *nh);
 
-extern int static_delete_route(afi_t afi, safi_t safi, uint8_t type,
-			       struct prefix *p, struct prefix_ipv6 *src_p,
-			       union g_addr *gate, const char *ifname,
-			       route_tag_t tag, uint8_t distance,
-			       struct static_vrf *svrf,
-			       struct static_nh_label *snh_label,
-			       uint32_t table_id);
+extern void static_delete_nexthop(struct static_nexthop *nh);
 
 extern void static_cleanup_vrf_ids(struct static_vrf *disable_svrf);
 
 extern void static_install_intf_nh(struct interface *ifp);
 
 extern void static_ifindex_update(struct interface *ifp, bool up);
+
+extern void static_install_path(struct static_path *pn);
+
+extern struct route_node *static_add_route(afi_t afi, safi_t safi,
+					   struct prefix *p,
+					   struct prefix_ipv6 *src_p,
+					   struct static_vrf *svrf);
+extern void static_del_route(struct route_node *rn);
+
+extern struct static_path *static_add_path(struct route_node *rn,
+					   uint32_t table_id, uint8_t distance);
+extern void static_del_path(struct static_path *pn);
+
+extern void static_get_nh_type(enum static_nh_type stype, char *type,
+			       size_t size);
+extern bool static_add_nexthop_validate(const char *nh_vrf_name,
+					enum static_nh_type type,
+					struct ipaddr *ipaddr);
+extern struct stable_info *static_get_stable_info(struct route_node *rn);
+
+extern void zebra_stable_node_cleanup(struct route_table *table,
+				      struct route_node *node);
+
+/*
+ * Max string return via API static_get_nh_str in size_t
+ */
+
+#define NEXTHOP_STR (INET6_ADDRSTRLEN + INTERFACE_NAMSIZ + 25)
+/*
+ * For the given nexthop, returns the string
+ * nexthop : returns the formatted string in nexthop
+ * size : max size of formatted string
+ */
+extern void static_get_nh_str(struct static_nexthop *nh, char *nexthop,
+			      size_t size);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif

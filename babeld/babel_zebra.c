@@ -39,7 +39,7 @@ void babelz_zebra_init(void);
 struct zclient *zclient;
 
 /* Debug types */
-static struct {
+static const struct {
     int type;
     int str_min_len;
     const char *str;
@@ -56,8 +56,7 @@ static struct {
 
 /* Zebra route add and delete treatment. */
 static int
-babel_zebra_read_route (int command, struct zclient *zclient,
-		        zebra_size_t length, vrf_id_t vrf)
+babel_zebra_read_route (ZAPI_CALLBACK_ARGS)
 {
     struct zapi_route api;
 
@@ -68,7 +67,7 @@ babel_zebra_read_route (int command, struct zclient *zclient,
     if (CHECK_FLAG(api.message, ZAPI_MESSAGE_SRCPFX))
         return 0;
 
-    if (command == ZEBRA_REDISTRIBUTE_ROUTE_ADD) {
+    if (cmd == ZEBRA_REDISTRIBUTE_ROUTE_ADD) {
         babel_route_add(&api);
     } else {
         babel_route_delete(&api);
@@ -235,20 +234,20 @@ babel_zebra_connected (struct zclient *zclient)
   zclient_send_reg_requests (zclient, VRF_DEFAULT);
 }
 
+static zclient_handler *const babel_handlers[] = {
+    [ZEBRA_INTERFACE_ADDRESS_ADD] = babel_interface_address_add,
+    [ZEBRA_INTERFACE_ADDRESS_DELETE] = babel_interface_address_delete,
+    [ZEBRA_REDISTRIBUTE_ROUTE_ADD] = babel_zebra_read_route,
+    [ZEBRA_REDISTRIBUTE_ROUTE_DEL] = babel_zebra_read_route,
+};
+
 void babelz_zebra_init(void)
 {
-    zclient = zclient_new(master, &zclient_options_default);
+    zclient = zclient_new(master, &zclient_options_default, babel_handlers,
+			  array_size(babel_handlers));
     zclient_init(zclient, ZEBRA_ROUTE_BABEL, 0, &babeld_privs);
 
     zclient->zebra_connected = babel_zebra_connected;
-    zclient->interface_add = babel_interface_add;
-    zclient->interface_delete = babel_interface_delete;
-    zclient->interface_up = babel_interface_up;
-    zclient->interface_down = babel_interface_down;
-    zclient->interface_address_add = babel_interface_address_add;
-    zclient->interface_address_delete = babel_interface_address_delete;
-    zclient->redistribute_route_add = babel_zebra_read_route;
-    zclient->redistribute_route_del = babel_zebra_read_route;
 
     install_element(BABEL_NODE, &babel_redistribute_type_cmd);
     install_element(ENABLE_NODE, &debug_babel_cmd);
@@ -256,7 +255,7 @@ void babelz_zebra_init(void)
     install_element(CONFIG_NODE, &debug_babel_cmd);
     install_element(CONFIG_NODE, &no_debug_babel_cmd);
 
-    install_element(VIEW_NODE, &show_debugging_babel_cmd);
+    install_element(ENABLE_NODE, &show_debugging_babel_cmd);
 }
 
 void

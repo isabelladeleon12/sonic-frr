@@ -55,16 +55,17 @@
 #include "eigrpd/eigrp_packet.h"
 #include "eigrpd/eigrp_network.h"
 #include "eigrpd/eigrp_topology.h"
-#include "eigrpd/eigrp_memory.h"
 #include "eigrpd/eigrp_filter.h"
 
-DEFINE_QOBJ_TYPE(eigrp)
+DEFINE_MGROUP(EIGRPD, "eigrpd");
+
+DEFINE_MTYPE_STATIC(EIGRPD, EIGRP_TOP, "EIGRP structure");
+
+DEFINE_QOBJ_TYPE(eigrp);
 
 static struct eigrp_master eigrp_master;
 
 struct eigrp_master *eigrp_om;
-
-static struct eigrp *eigrp_new(const char *);
 
 extern struct zclient *zclient;
 extern struct in_addr router_id_zebra;
@@ -95,16 +96,16 @@ extern struct in_addr router_id_zebra;
  */
 void eigrp_router_id_update(struct eigrp *eigrp)
 {
-	struct vrf *vrf = vrf_lookup_by_id(VRF_DEFAULT);
+	struct vrf *vrf = vrf_lookup_by_id(eigrp->vrf_id);
 	struct interface *ifp;
 	struct in_addr router_id, router_id_old;
 
 	router_id_old = eigrp->router_id;
 
-	if (eigrp->router_id_static.s_addr != 0)
+	if (eigrp->router_id_static.s_addr != INADDR_ANY)
 		router_id = eigrp->router_id_static;
 
-	else if (eigrp->router_id.s_addr != 0)
+	else if (eigrp->router_id.s_addr != INADDR_ANY)
 		router_id = eigrp->router_id;
 
 	else
@@ -112,10 +113,6 @@ void eigrp_router_id_update(struct eigrp *eigrp)
 
 	eigrp->router_id = router_id;
 	if (router_id_old.s_addr != router_id.s_addr) {
-		//      if (IS_DEBUG_EIGRP_EVENT)
-		//        zlog_debug("Router-ID[NEW:%s]: Update",
-		//        inet_ntoa(eigrp->router_id));
-
 		/* update eigrp_interface's */
 		FOR_ALL_INTERFACES (vrf, ifp)
 			eigrp_if_update(ifp);
@@ -126,7 +123,7 @@ void eigrp_master_init(void)
 {
 	struct timeval tv;
 
-	memset(&eigrp_master, 0, sizeof(struct eigrp_master));
+	memset(&eigrp_master, 0, sizeof(eigrp_master));
 
 	eigrp_om = &eigrp_master;
 	eigrp_om->eigrp = list_new();
@@ -136,16 +133,16 @@ void eigrp_master_init(void)
 }
 
 /* Allocate new eigrp structure. */
-static struct eigrp *eigrp_new(const char *AS)
+static struct eigrp *eigrp_new(uint16_t as, vrf_id_t vrf_id)
 {
 	struct eigrp *eigrp = XCALLOC(MTYPE_EIGRP_TOP, sizeof(struct eigrp));
-	int eigrp_socket;
 
 	/* init information relevant to peers */
+	eigrp->vrf_id = vrf_id;
 	eigrp->vrid = 0;
-	eigrp->AS = atoi(AS);
-	eigrp->router_id.s_addr = 0;
-	eigrp->router_id_static.s_addr = 0;
+	eigrp->AS = as;
+	eigrp->router_id.s_addr = INADDR_ANY;
+	eigrp->router_id_static.s_addr = INADDR_ANY;
 	eigrp->sequence_number = 1;
 
 	/*Configure default K Values for EIGRP Process*/
@@ -161,19 +158,20 @@ static struct eigrp *eigrp_new(const char *AS)
 	eigrp->passive_interface_default = EIGRP_IF_ACTIVE;
 	eigrp->networks = eigrp_topology_new();
 
-	if ((eigrp_socket = eigrp_sock_init()) < 0) {
+	eigrp->fd = eigrp_sock_init(vrf_lookup_by_id(vrf_id));
+
+	if (eigrp->fd < 0) {
 		flog_err_sys(
 			EC_LIB_SOCKET,
-			"eigrp_new: fatal error: eigrp_sock_init was unable to open a socket");
+			"%s: fatal error: eigrp_sock_init was unable to open a socket",
+			__func__);
 		exit(1);
 	}
 
-	eigrp->fd = eigrp_socket;
 	eigrp->maxsndbuflen = getsockopt_so_sendbuf(eigrp->fd);
 
 	eigrp->ibuf = stream_new(EIGRP_PACKET_MAX_LEN + 1);
 
-	eigrp->t_read = NULL;
 	thread_add_read(master, eigrp_read, eigrp, eigrp->fd, &eigrp->t_read);
 	eigrp->oi_write_q = list_new();
 
@@ -200,16 +198,15 @@ static struct eigrp *eigrp_new(const char *AS)
 	eigrp->routemap[EIGRP_FILTER_OUT] = NULL;
 
 	/* Distribute list install. */
-	eigrp->distribute_ctx = distribute_list_ctx_create(
-					   vrf_lookup_by_id(VRF_DEFAULT));
+	eigrp->distribute_ctx =
+		distribute_list_ctx_create(vrf_lookup_by_id(eigrp->vrf_id));
 	distribute_list_add_hook(eigrp->distribute_ctx,
 				 eigrp_distribute_update);
 	distribute_list_delete_hook(eigrp->distribute_ctx,
 				    eigrp_distribute_update);
 
 	/*
-	  eigrp->if_rmap_ctx = if_rmap_ctx_create(
-	                               VRF_DEFAULT_NAME);
+	  eigrp->if_rmap_ctx = if_rmap_ctx_create(eigrp->vrf_id);
 	  if_rmap_hook_add (eigrp_if_rmap_update);
 	  if_rmap_hook_delete (eigrp_if_rmap_update);
 	*/
@@ -217,13 +214,13 @@ static struct eigrp *eigrp_new(const char *AS)
 	return eigrp;
 }
 
-struct eigrp *eigrp_get(const char *AS)
+struct eigrp *eigrp_get(uint16_t as, vrf_id_t vrf_id)
 {
 	struct eigrp *eigrp;
 
-	eigrp = eigrp_lookup();
+	eigrp = eigrp_lookup(vrf_id);
 	if (eigrp == NULL) {
-		eigrp = eigrp_new(AS);
+		eigrp = eigrp_new(as, vrf_id);
 		listnode_add(eigrp_om->eigrp, eigrp);
 	}
 
@@ -285,7 +282,7 @@ void eigrp_finish_final(struct eigrp *eigrp)
 	list_delete(&eigrp->eiflist);
 	list_delete(&eigrp->oi_write_q);
 
-	eigrp_topology_free(eigrp->topology_table);
+	eigrp_topology_free(eigrp, eigrp->topology_table);
 
 	eigrp_nbr_delete(eigrp->neighbor_self);
 
@@ -300,10 +297,14 @@ void eigrp_finish_final(struct eigrp *eigrp)
 }
 
 /*Look for existing eigrp process*/
-struct eigrp *eigrp_lookup(void)
+struct eigrp *eigrp_lookup(vrf_id_t vrf_id)
 {
-	if (listcount(eigrp_om->eigrp) == 0)
-		return NULL;
+	struct eigrp *eigrp;
+	struct listnode *node, *nnode;
 
-	return listgetdata(listhead(eigrp_om->eigrp));
+	for (ALL_LIST_ELEMENTS(eigrp_om->eigrp, node, nnode, eigrp))
+		if (eigrp->vrf_id == vrf_id)
+			return eigrp;
+
+	return NULL;
 }

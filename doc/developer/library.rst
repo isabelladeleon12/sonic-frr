@@ -8,10 +8,14 @@ Library Facilities (libfrr)
    :maxdepth: 2
 
    memtypes
+   rcu
    lists
    logging
+   xrefs
+   locking
    hooks
    cli
    modules
+   scripting
 
 

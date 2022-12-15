@@ -27,7 +27,6 @@
 #include "vty.h"
 #include "command.h"
 #include "memory.h"
-#include "memory_vty.h"
 #include "thread.h"
 #include "log.h"
 #include "prefix.h"
@@ -37,14 +36,13 @@
 #include "vrf.h"
 #include "if_rmap.h"
 #include "libfrr.h"
+#include "routemap.h"
 
 #include "ripngd/ripngd.h"
+#include "ripngd/ripng_nb.h"
 
 /* RIPngd options. */
-#if CONFDATE > 20190521
-	CPP_NOTICE("-r / --retain has reached deprecation EOL, remove")
-#endif
-struct option longopts[] = {{"retain", no_argument, NULL, 'r'}, {0}};
+struct option longopts[] = {{0}};
 
 /* ripngd privileges */
 zebra_capabilities_t _caps_p[] = {ZCAP_NET_RAW, ZCAP_BIND, ZCAP_SYS_ADMIN};
@@ -96,7 +94,7 @@ static void sigusr1(void)
 	zlog_rotate();
 }
 
-struct quagga_signal_t ripng_signals[] = {
+struct frr_signal_t ripng_signals[] = {
 	{
 		.signal = SIGHUP,
 		.handler = &sighup,
@@ -115,9 +113,12 @@ struct quagga_signal_t ripng_signals[] = {
 	},
 };
 
-static const struct frr_yang_module_info *ripngd_yang_modules[] = {
+static const struct frr_yang_module_info *const ripngd_yang_modules[] = {
+	&frr_filter_info,
 	&frr_interface_info,
 	&frr_ripngd_info,
+	&frr_route_map_info,
+	&frr_vrf_info,
 };
 
 FRR_DAEMON_INFO(ripngd, RIPNG, .vty_port = RIPNG_VTY_PORT,
@@ -130,12 +131,10 @@ FRR_DAEMON_INFO(ripngd, RIPNG, .vty_port = RIPNG_VTY_PORT,
 		.privs = &ripngd_privs,
 
 		.yang_modules = ripngd_yang_modules,
-		.n_yang_modules = array_size(ripngd_yang_modules), )
+		.n_yang_modules = array_size(ripngd_yang_modules),
+);
 
-#if CONFDATE > 20190521
-CPP_NOTICE("-r / --retain has reached deprecation EOL, remove")
-#endif
-#define DEPRECATED_OPTIONS "r"
+#define DEPRECATED_OPTIONS ""
 
 /* RIPngd main routine. */
 int main(int argc, char **argv)
@@ -164,7 +163,6 @@ int main(int argc, char **argv)
 			break;
 		default:
 			frr_help_exit(1);
-			break;
 		}
 	}
 

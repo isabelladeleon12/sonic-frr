@@ -53,8 +53,9 @@
 			listnode_add((O)->oi_write_q, oi);                     \
 			oi->on_write_q = 1;                                    \
 		}                                                              \
-		thread_add_write(master, ospf_write, (O), (O)->fd,             \
-				 &(O)->t_write);                               \
+		if (!list_isempty((O)->oi_write_q))                            \
+			thread_add_write(master, ospf_write, (O), (O)->fd,     \
+					 &(O)->t_write);                       \
 	} while (0)
 
 /* Macro for OSPF ISM timer turn on. */
@@ -77,15 +78,6 @@
 					  OSPF_IF_PARAM((O), v_hello));        \
 	} while (0)
 
-/* Macro for OSPF ISM timer turn off. */
-#define OSPF_ISM_TIMER_OFF(X)                                                  \
-	do {                                                                   \
-		if (X) {                                                       \
-			thread_cancel(X);                                      \
-			(X) = NULL;                                            \
-		}                                                              \
-	} while (0)
-
 /* Macro for OSPF schedule event. */
 #define OSPF_ISM_EVENT_SCHEDULE(I, E)                                          \
 	thread_add_event(master, ospf_ism_event, (I), (E), NULL)
@@ -95,12 +87,13 @@
 	thread_execute(master, ospf_ism_event, (I), (E))
 
 /* Prototypes. */
-extern int ospf_ism_event(struct thread *);
+extern void ospf_ism_event(struct thread *thread);
 extern void ism_change_status(struct ospf_interface *, int);
-extern int ospf_hello_timer(struct thread *thread);
+extern void ospf_hello_timer(struct thread *thread);
+extern int ospf_dr_election(struct ospf_interface *oi);
 
 DECLARE_HOOK(ospf_ism_change,
 	     (struct ospf_interface * oi, int state, int oldstate),
-	     (oi, state, oldstate))
+	     (oi, state, oldstate));
 
 #endif /* _ZEBRA_OSPF_ISM_H */

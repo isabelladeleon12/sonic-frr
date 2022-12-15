@@ -13,8 +13,11 @@ Installing Dependencies
 
    sudo dnf install git autoconf automake libtool make \
      readline-devel texinfo net-snmp-devel groff pkgconfig json-c-devel \
-     pam-devel pytest bison flex c-ares-devel python3-devel python2-sphinx \
-     perl-core patch
+     pam-devel python3-pytest bison flex c-ares-devel python3-devel \
+     python3-sphinx perl-core patch libcap-devel \
+     elfutils-libelf-devel libunwind-devel
+
+.. include:: building-libunwind-note.rst
 
 .. include:: building-libyang.rst
 
@@ -78,7 +81,7 @@ content:
    MPLS must be invidividually enabled on each interface that requires it. See
    the example in the config block above.
 
-Load the modifed sysctls on the system:
+Load the modified sysctls on the system:
 
 .. code-block:: console
 
@@ -98,13 +101,24 @@ And load the kernel modules on the running system:
 
    sudo modprobe mpls-router mpls-iptunnel
 
-Install service files
-^^^^^^^^^^^^^^^^^^^^^
+
+.. note::
+   Fedora ships with the ``firewalld`` service enabled. You may run into some
+   issues with the iptables rules it installs by default. If you wish to just
+   stop the service and clear `ALL` rules do these commands:
+
+   .. code-block:: console
+
+      sudo systemctl disable firewalld.service
+      sudo systemctl stop firewalld.service
+      sudo iptables -F
+
+Install frr Service
+^^^^^^^^^^^^^^^^^^^
 
 .. code-block:: console
 
-   sudo install -p -m 644 redhat/frr.service /usr/lib/systemd/system/frr.service
-   sudo install -p -m 755 redhat/frr.init /usr/lib/frr/frr
+   sudo install -p -m 644 tools/frr.service /usr/lib/systemd/system/frr.service
    sudo systemctl enable frr
 
 Enable daemons

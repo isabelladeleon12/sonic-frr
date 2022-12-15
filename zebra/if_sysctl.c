@@ -21,14 +21,13 @@
 
 #include <zebra.h>
 
-#if !defined(GNU_LINUX) && !defined(OPEN_BSD) && !defined(SUNOS_5)
+#if !defined(GNU_LINUX) && !defined(OPEN_BSD)
 
 #include "if.h"
 #include "sockunion.h"
 #include "prefix.h"
 #include "connected.h"
 #include "memory.h"
-#include "zebra_memory.h"
 #include "ioctl.h"
 #include "log.h"
 #include "interface.h"
@@ -98,7 +97,7 @@ void interface_list(struct zebra_ns *zns)
 		NET_RT_IFLIST, 0};
 
 	if (zns->ns_id != NS_DEFAULT) {
-		zlog_debug("interface_list: ignore NS %u", zns->ns_id);
+		zlog_debug("%s: ignore NS %u", __func__, zns->ns_id);
 		return;
 	}
 
@@ -133,7 +132,7 @@ void interface_list(struct zebra_ns *zns)
 			ifam_read((struct ifa_msghdr *)ifm);
 			break;
 		default:
-			zlog_info("interfaces_list(): unexpected message type");
+			zlog_info("%s: unexpected message type", __func__);
 			XFREE(MTYPE_TMP, ref);
 			return;
 			break;
@@ -144,4 +143,4 @@ void interface_list(struct zebra_ns *zns)
 	XFREE(MTYPE_TMP, ref);
 }
 
-#endif /* !defined(GNU_LINUX) && !defined(OPEN_BSD) && !defined(SUNOS_5) */
+#endif /* !defined(GNU_LINUX) && !defined(OPEN_BSD) */

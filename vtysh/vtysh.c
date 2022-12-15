@@ -26,8 +26,12 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 
+/* readline carries some ancient definitions around */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-prototypes"
 #include <readline/readline.h>
 #include <readline/history.h>
+#pragma GCC diagnostic pop
 
 #include <dirent.h>
 #include <stdio.h>
@@ -36,24 +40,29 @@
 #include "linklist.h"
 #include "command.h"
 #include "memory.h"
+#include "network.h"
 #include "filter.h"
 #include "vtysh/vtysh.h"
+#include "vtysh/vtysh_daemons.h"
 #include "log.h"
-#include "bgpd/bgp_vty.h"
-#include "ns.h"
 #include "vrf.h"
 #include "libfrr.h"
 #include "command_graph.h"
 #include "frrstr.h"
 #include "json.h"
+#include "ferr.h"
+#include "bgpd/bgp_vty.h"
 
-DEFINE_MTYPE_STATIC(MVTYSH, VTYSH_CMD, "Vtysh cmd copy")
+DEFINE_MTYPE_STATIC(MVTYSH, VTYSH_CMD, "Vtysh cmd copy");
 
 /* Struct VTY. */
 struct vty *vty;
 
 /* VTY shell pager name. */
 char *vtysh_pager_name = NULL;
+
+/* VTY should add timestamp */
+bool vtysh_add_timestamp;
 
 /* VTY shell client structure */
 struct vtysh_client {
@@ -62,7 +71,14 @@ struct vtysh_client {
 	int flag;
 	char path[MAXPATHLEN];
 	struct vtysh_client *next;
+
+	struct thread *log_reader;
+	int log_fd;
+	uint32_t lost_msgs;
 };
+
+static bool stderr_tty;
+static bool stderr_stdout_same;
 
 /* Some utility functions for working on vtysh-specific vty tasks */
 
@@ -119,25 +135,43 @@ static void vtysh_pager_envdef(bool fallback)
 /* --- */
 
 struct vtysh_client vtysh_client[] = {
-	{.fd = -1, .name = "zebra", .flag = VTYSH_ZEBRA, .next = NULL},
-	{.fd = -1, .name = "ripd", .flag = VTYSH_RIPD, .next = NULL},
-	{.fd = -1, .name = "ripngd", .flag = VTYSH_RIPNGD, .next = NULL},
-	{.fd = -1, .name = "ospfd", .flag = VTYSH_OSPFD, .next = NULL},
-	{.fd = -1, .name = "ospf6d", .flag = VTYSH_OSPF6D, .next = NULL},
-	{.fd = -1, .name = "ldpd", .flag = VTYSH_LDPD, .next = NULL},
-	{.fd = -1, .name = "bgpd", .flag = VTYSH_BGPD, .next = NULL},
-	{.fd = -1, .name = "isisd", .flag = VTYSH_ISISD, .next = NULL},
-	{.fd = -1, .name = "pimd", .flag = VTYSH_PIMD, .next = NULL},
-	{.fd = -1, .name = "nhrpd", .flag = VTYSH_NHRPD, .next = NULL},
-	{.fd = -1, .name = "eigrpd", .flag = VTYSH_EIGRPD, .next = NULL},
-	{.fd = -1, .name = "babeld", .flag = VTYSH_BABELD, .next = NULL},
-	{.fd = -1, .name = "sharpd", .flag = VTYSH_SHARPD, .next = NULL},
-	{.fd = -1, .name = "fabricd", .flag = VTYSH_FABRICD, .next = NULL},
-	{.fd = -1, .name = "watchfrr", .flag = VTYSH_WATCHFRR, .next = NULL},
-	{.fd = -1, .name = "pbrd", .flag = VTYSH_PBRD, .next = NULL},
-	{.fd = -1, .name = "staticd", .flag = VTYSH_STATICD, .next = NULL},
-	{.fd = -1, .name = "bfdd", .flag = VTYSH_BFDD, .next = NULL},
+	{.name = "zebra", .flag = VTYSH_ZEBRA},
+	{.name = "ripd", .flag = VTYSH_RIPD},
+	{.name = "ripngd", .flag = VTYSH_RIPNGD},
+	{.name = "ospfd", .flag = VTYSH_OSPFD},
+	{.name = "ospf6d", .flag = VTYSH_OSPF6D},
+	{.name = "ldpd", .flag = VTYSH_LDPD},
+	{.name = "bgpd", .flag = VTYSH_BGPD},
+	{.name = "isisd", .flag = VTYSH_ISISD},
+	{.name = "pimd", .flag = VTYSH_PIMD},
+	{.name = "nhrpd", .flag = VTYSH_NHRPD},
+	{.name = "eigrpd", .flag = VTYSH_EIGRPD},
+	{.name = "babeld", .flag = VTYSH_BABELD},
+	{.name = "sharpd", .flag = VTYSH_SHARPD},
+	{.name = "fabricd", .flag = VTYSH_FABRICD},
+	{.name = "watchfrr", .flag = VTYSH_WATCHFRR},
+	{.name = "pbrd", .flag = VTYSH_PBRD},
+	{.name = "staticd", .flag = VTYSH_STATICD},
+	{.name = "bfdd", .flag = VTYSH_BFDD},
+	{.name = "vrrpd", .flag = VTYSH_VRRPD},
+	{.name = "pathd", .flag = VTYSH_PATHD},
+	{.name = "pim6d", .flag = VTYSH_PIM6D},
 };
+
+/* Searches for client by name, returns index */
+static int vtysh_client_lookup(const char *name)
+{
+	int idx = -1;
+
+	for (unsigned int i = 0; i < array_size(vtysh_client); i++) {
+		if (strmatch(vtysh_client[i].name, name)) {
+			idx = i;
+			break;
+		}
+	}
+
+	return idx;
+}
 
 enum vtysh_write_integrated vtysh_write_integrated =
 	WRITE_INTEGRATED_UNSPECIFIED;
@@ -147,13 +181,61 @@ static int vtysh_reconnect(struct vtysh_client *vclient);
 static void vclient_close(struct vtysh_client *vclient)
 {
 	if (vclient->fd >= 0) {
-		vty_out(vty,
-			"Warning: closing connection to %s because of an I/O error!\n",
-			vclient->name);
+		if (vty->of)
+			vty_out(vty,
+				"Warning: closing connection to %s because of an I/O error!\n",
+				vclient->name);
 		close(vclient->fd);
 		/* indicate as candidate for reconnect */
 		vclient->fd = VTYSH_WAS_ACTIVE;
 	}
+}
+
+static ssize_t vtysh_client_receive(struct vtysh_client *vclient, char *buf,
+				    size_t bufsz, int *pass_fd)
+{
+	struct iovec iov[1] = {
+		{
+			.iov_base = buf,
+			.iov_len = bufsz,
+		},
+	};
+	union {
+		uint8_t buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} u;
+	struct msghdr mh = {
+		.msg_iov = iov,
+		.msg_iovlen = array_size(iov),
+		.msg_control = u.buf,
+		.msg_controllen = sizeof(u.buf),
+	};
+	struct cmsghdr *cmh = CMSG_FIRSTHDR(&mh);
+	ssize_t ret;
+
+	cmh->cmsg_level = SOL_SOCKET;
+	cmh->cmsg_type = SCM_RIGHTS;
+	cmh->cmsg_len = CMSG_LEN(sizeof(int));
+	memset(CMSG_DATA(cmh), -1, sizeof(int));
+
+	do {
+		ret = recvmsg(vclient->fd, &mh, 0);
+		if (ret >= 0 || (errno != EINTR && errno != EAGAIN))
+			break;
+	} while (true);
+
+	if (cmh->cmsg_len == CMSG_LEN(sizeof(int))) {
+		int fd;
+
+		memcpy(&fd, CMSG_DATA(cmh), sizeof(int));
+		if (fd != -1) {
+			if (pass_fd)
+				*pass_fd = fd;
+			else
+				close(fd);
+		}
+	}
+	return ret;
 }
 
 /*
@@ -179,7 +261,8 @@ static void vclient_close(struct vtysh_client *vclient)
  *    a status code
  */
 static int vtysh_client_run(struct vtysh_client *vclient, const char *line,
-			    void (*callback)(void *, const char *), void *cbarg)
+			    void (*callback)(void *, const char *), void *cbarg,
+			    int *pass_fd)
 {
 	int ret;
 	char stackbuf[4096];
@@ -213,15 +296,20 @@ static int vtysh_client_run(struct vtysh_client *vclient, const char *line,
 
 	bufvalid = buf;
 	do {
-		ssize_t nread =
-			read(vclient->fd, bufvalid, buf + bufsz - bufvalid - 1);
+		ssize_t nread;
+
+		nread = vtysh_client_receive(
+			vclient, bufvalid, buf + bufsz - bufvalid - 1, pass_fd);
 
 		if (nread < 0 && (errno == EINTR || errno == EAGAIN))
 			continue;
 
 		if (nread <= 0) {
-			vty_out(vty, "vtysh: error reading from %s: %s (%d)",
-				vclient->name, safe_strerror(errno), errno);
+			if (vty->of)
+				vty_out(vty,
+					"vtysh: error reading from %s: %s (%d)",
+					vclient->name, safe_strerror(errno),
+					errno);
 			goto out_err;
 		}
 
@@ -353,7 +441,7 @@ static int vtysh_client_run_all(struct vtysh_client *head_client,
 	int correct_instance = 0, wrong_instance = 0;
 
 	for (client = head_client; client; client = client->next) {
-		rc = vtysh_client_run(client, line, callback, cbarg);
+		rc = vtysh_client_run(client, line, callback, cbarg, NULL);
 		if (rc == CMD_NOT_MY_INSTANCE) {
 			wrong_instance++;
 			continue;
@@ -366,7 +454,7 @@ static int vtysh_client_run_all(struct vtysh_client *head_client,
 			rc_all = rc;
 		}
 	}
-	if (wrong_instance && !correct_instance) {
+	if (wrong_instance && !correct_instance && vty->of) {
 		vty_out(vty,
 			"%% [%s]: command ignored as it targets an instance that is not running\n",
 			head_client->name);
@@ -391,6 +479,23 @@ static int vtysh_client_execute(struct vtysh_client *head_client,
 				const char *line)
 {
 	return vtysh_client_run_all(head_client, line, 0, NULL, NULL);
+}
+
+/* Execute by name */
+static int vtysh_client_execute_name(const char *name, const char *line)
+{
+	int ret = CMD_SUCCESS;
+	int idx_client = -1;
+
+	idx_client = vtysh_client_lookup(name);
+	if (idx_client != -1)
+		ret = vtysh_client_execute(&vtysh_client[idx_client], line);
+	else {
+		vty_out(vty, "Client not found\n");
+		ret = CMD_WARNING;
+	}
+
+	return ret;
 }
 
 /*
@@ -436,12 +541,11 @@ static int vtysh_execute_func(const char *line, int pager)
 	if (vline == NULL)
 		return CMD_SUCCESS;
 
-	if (user_mode) {
-		if (strncmp("en", vector_slot(vline, 0), 2) == 0) {
-			cmd_free_strvec(vline);
-			vty_out(vty, "%% Command not allowed: enable\n");
-			return CMD_WARNING;
-		}
+	if (vtysh_add_timestamp && strncmp(line, "exit", 4)) {
+		char ts[48];
+
+		(void)frr_timestamp(3, ts, sizeof(ts));
+		vty_out(vty, "%% %s\n\n", ts);
 	}
 
 	saved_ret = ret = cmd_execute(vty, line, &cmd, 1);
@@ -454,6 +558,7 @@ static int vtysh_execute_func(const char *line, int pager)
 	 */
 	while (ret != CMD_SUCCESS && ret != CMD_SUCCESS_DAEMON
 	       && ret != CMD_WARNING && ret != CMD_WARNING_CONFIG_FAILED
+	       && ret != CMD_ERR_AMBIGUOUS && ret != CMD_ERR_INCOMPLETE
 	       && vty->node > CONFIG_NODE) {
 		vty->node = node_parent(vty->node);
 		ret = cmd_execute(vty, line, &cmd, 1);
@@ -468,42 +573,8 @@ static int vtysh_execute_func(const char *line, int pager)
 	 */
 	if (ret == CMD_SUCCESS || ret == CMD_SUCCESS_DAEMON
 	    || ret == CMD_WARNING) {
-		if ((saved_node == BGP_VPNV4_NODE
-		     || saved_node == BGP_VPNV6_NODE
-		     || saved_node == BGP_IPV4_NODE
-		     || saved_node == BGP_IPV6_NODE
-		     || saved_node == BGP_FLOWSPECV4_NODE
-		     || saved_node == BGP_FLOWSPECV6_NODE
-		     || saved_node == BGP_IPV4M_NODE
-		     || saved_node == BGP_IPV4L_NODE
-		     || saved_node == BGP_IPV6L_NODE
-		     || saved_node == BGP_IPV6M_NODE
-		     || saved_node == BGP_EVPN_NODE
-		     || saved_node == LDP_IPV4_NODE
-		     || saved_node == LDP_IPV6_NODE)
-		    && (tried == 1)) {
-			vtysh_execute("exit-address-family");
-		} else if ((saved_node == BGP_EVPN_VNI_NODE) && (tried == 1)) {
-			vtysh_execute("exit-vni");
-		} else if (saved_node == BGP_VRF_POLICY_NODE && (tried == 1)) {
-			vtysh_execute("exit-vrf-policy");
-		} else if ((saved_node == BGP_VNC_DEFAULTS_NODE
-			    || saved_node == BGP_VNC_NVE_GROUP_NODE
-			    || saved_node == BGP_VNC_L2_GROUP_NODE)
-			   && (tried == 1)) {
-			vtysh_execute("exit-vnc");
-		} else if (saved_node == VRF_NODE && (tried == 1)) {
-			vtysh_execute("exit-vrf");
-		} else if ((saved_node == KEYCHAIN_KEY_NODE
-			    || saved_node == LDP_PSEUDOWIRE_NODE
-			    || saved_node == LDP_IPV4_IFACE_NODE
-			    || saved_node == LDP_IPV6_IFACE_NODE)
-			   && (tried == 1)) {
+		while (tried-- > 0)
 			vtysh_execute("exit");
-		} else if (tried) {
-			vtysh_execute("end");
-			vtysh_execute("configure terminal");
-		}
 	}
 	/*
 	 * If command didn't succeed in any node, continue with return value
@@ -540,7 +611,7 @@ static int vtysh_execute_func(const char *line, int pager)
 		if (pager && strncmp(line, "exit", 4))
 			vty_open_pager(vty);
 
-		if (!strcmp(cmd->string, "configure terminal")) {
+		if (!strcmp(cmd->string, "configure")) {
 			for (i = 0; i < array_size(vtysh_client); i++) {
 				cmd_stat = vtysh_client_execute(
 					&vtysh_client[i], line);
@@ -591,7 +662,8 @@ static int vtysh_execute_func(const char *line, int pager)
 						fprintf(stderr,
 							"%s is not running\n",
 							vtysh_client[i].name);
-						continue;
+						cmd_stat = CMD_ERR_NO_DAEMON;
+						break;
 					}
 				}
 				cmd_stat = vtysh_client_execute(
@@ -600,7 +672,7 @@ static int vtysh_execute_func(const char *line, int pager)
 					break;
 			}
 		}
-		if (cmd_stat != CMD_SUCCESS)
+		if (cmd_stat != CMD_SUCCESS && cmd_stat != CMD_ERR_NO_DAEMON)
 			break;
 
 		if (cmd->func)
@@ -634,11 +706,11 @@ static char *trim(char *s)
 		return s;
 
 	end = s + size - 1;
-	while (end >= s && isspace((int)*end))
+	while (end >= s && isspace((unsigned char)*end))
 		end--;
 	*(end + 1) = '\0';
 
-	while (*s && isspace((int)*s))
+	while (*s && isspace((unsigned char)*s))
 		s++;
 
 	return s;
@@ -665,46 +737,23 @@ int vtysh_mark_file(const char *filename)
 	if (confp == NULL) {
 		fprintf(stderr, "%% Can't open config file %s due to '%s'.\n",
 			filename, safe_strerror(errno));
-		return (CMD_ERR_NO_FILE);
+		return CMD_ERR_NO_FILE;
 	}
 
 	vty = vty_new();
-	vty->wfd = STDERR_FILENO;
+	vty->wfd = STDOUT_FILENO;
 	vty->type = VTY_TERM;
 	vty->node = CONFIG_NODE;
 
 	vtysh_execute_no_pager("enable");
-	vtysh_execute_no_pager("configure terminal");
+	vtysh_execute_no_pager("configure");
 	vty_buf_copy = XCALLOC(MTYPE_VTYSH_CMD, VTY_BUFSIZ);
 
 	while (fgets(vty->buf, VTY_BUFSIZ, confp)) {
 		lineno++;
 		tried = 0;
-		strcpy(vty_buf_copy, vty->buf);
+		strlcpy(vty_buf_copy, vty->buf, VTY_BUFSIZ);
 		vty_buf_trimmed = trim(vty_buf_copy);
-
-		switch (vty->node) {
-		case LDP_IPV4_IFACE_NODE:
-			if (strncmp(vty_buf_copy, "   ", 3)) {
-				vty_out(vty, "  end\n");
-				vty->node = LDP_IPV4_NODE;
-			}
-			break;
-		case LDP_IPV6_IFACE_NODE:
-			if (strncmp(vty_buf_copy, "   ", 3)) {
-				vty_out(vty, "  end\n");
-				vty->node = LDP_IPV6_NODE;
-			}
-			break;
-		case LDP_PSEUDOWIRE_NODE:
-			if (strncmp(vty_buf_copy, "  ", 2)) {
-				vty_out(vty, " end\n");
-				vty->node = LDP_L2VPN_NODE;
-			}
-			break;
-		default:
-			break;
-		}
 
 		if (vty_buf_trimmed[0] == '!' || vty_buf_trimmed[0] == '#') {
 			vty_out(vty, "%s", vty->buf);
@@ -739,6 +788,7 @@ int vtysh_mark_file(const char *filename)
 		 */
 		while (ret != CMD_SUCCESS && ret != CMD_SUCCESS_DAEMON
 		       && ret != CMD_WARNING && ret != CMD_WARNING_CONFIG_FAILED
+		       && ret != CMD_ERR_AMBIGUOUS && ret != CMD_ERR_INCOMPLETE
 		       && vty->node > CONFIG_NODE) {
 			vty->node = node_parent(vty->node);
 			ret = cmd_execute_command_strict(vline, vty, &cmd);
@@ -752,28 +802,8 @@ int vtysh_mark_file(const char *filename)
 		 */
 		if (ret == CMD_SUCCESS || ret == CMD_SUCCESS_DAEMON
 		    || ret == CMD_WARNING) {
-			if ((prev_node == BGP_VPNV4_NODE
-			     || prev_node == BGP_VPNV6_NODE
-			     || prev_node == BGP_IPV4_NODE
-			     || prev_node == BGP_IPV6_NODE
-			     || prev_node == BGP_FLOWSPECV4_NODE
-			     || prev_node == BGP_FLOWSPECV6_NODE
-			     || prev_node == BGP_IPV4L_NODE
-			     || prev_node == BGP_IPV6L_NODE
-			     || prev_node == BGP_IPV4M_NODE
-			     || prev_node == BGP_IPV6M_NODE
-			     || prev_node == BGP_EVPN_NODE)
-			    && (tried == 1)) {
-				vty_out(vty, "exit-address-family\n");
-			} else if ((prev_node == BGP_EVPN_VNI_NODE)
-				   && (tried == 1)) {
-				vty_out(vty, "exit-vni\n");
-			} else if ((prev_node == KEYCHAIN_KEY_NODE)
-				   && (tried == 1)) {
+			while (tried-- > 0)
 				vty_out(vty, "exit\n");
-			} else if (tried) {
-				vty_out(vty, "end\n");
-			}
 		}
 		/*
 		 * If command didn't succeed in any node, continue with return
@@ -818,11 +848,15 @@ int vtysh_mark_file(const char *filename)
 			return CMD_ERR_INCOMPLETE;
 		case CMD_SUCCESS:
 			vty_out(vty, "%s", vty->buf);
+			if (strmatch(vty_buf_trimmed, "exit-vrf"))
+				vty_out(vty, "end\n");
 			break;
 		case CMD_SUCCESS_DAEMON: {
 			int cmd_stat;
 
 			vty_out(vty, "%s", vty->buf);
+			if (strmatch(vty_buf_trimmed, "exit-vrf"))
+				vty_out(vty, "end\n");
 			cmd_stat = vtysh_client_execute(&vtysh_client[0],
 							vty->buf);
 			if (cmd_stat != CMD_SUCCESS)
@@ -841,10 +875,10 @@ int vtysh_mark_file(const char *filename)
 	if (confp != stdin)
 		fclose(confp);
 
-	return (0);
+	return 0;
 }
 
-/* Configration make from file. */
+/* Configuration make from file. */
 int vtysh_config_from_file(struct vty *vty, FILE *fp)
 {
 	int ret;
@@ -852,9 +886,22 @@ int vtysh_config_from_file(struct vty *vty, FILE *fp)
 	int lineno = 0;
 	/* once we have an error, we remember & return that */
 	int retcode = CMD_SUCCESS;
+	char *vty_buf_copy = XCALLOC(MTYPE_VTYSH_CMD, VTY_BUFSIZ);
+	char *vty_buf_trimmed = NULL;
 
 	while (fgets(vty->buf, VTY_BUFSIZ, fp)) {
 		lineno++;
+
+		strlcpy(vty_buf_copy, vty->buf, VTY_BUFSIZ);
+		vty_buf_trimmed = trim(vty_buf_copy);
+
+		/*
+		 * Ignore the "end" lines, we will generate these where
+		 * appropriate, otherwise we never execute
+		 * XFRR_end_configuration, and start/end markers do not work.
+		 */
+		if (strmatch(vty_buf_trimmed, "end"))
+			continue;
 
 		ret = command_config_read_one_line(vty, &cmd, lineno, 1);
 
@@ -922,6 +969,8 @@ int vtysh_config_from_file(struct vty *vty, FILE *fp)
 		}
 	}
 
+	XFREE(MTYPE_VTYSH_CMD, vty_buf_copy);
+
 	return (retcode);
 }
 
@@ -945,7 +994,7 @@ static int vtysh_process_questionmark(const char *input, int input_len)
 	if (vline == NULL) {
 		vline = vector_init(1);
 		vector_set(vline, NULL);
-	} else if (input_len && isspace((int)input[input_len - 1]))
+	} else if (input_len && isspace((unsigned char)input[input_len - 1]))
 		vector_set(vline, NULL);
 
 	describe = cmd_describe_command(vline, vty, &ret);
@@ -958,7 +1007,6 @@ static int vtysh_process_questionmark(const char *input, int input_len)
 		vty_out(vty, "%% Ambiguous command.\n");
 		rl_on_new_line();
 		return 0;
-		break;
 	case CMD_ERR_NO_MATCH:
 		cmd_free_strvec(vline);
 		if (describe)
@@ -966,7 +1014,6 @@ static int vtysh_process_questionmark(const char *input, int input_len)
 		vty_out(vty, "%% There is no matched command.\n");
 		rl_on_new_line();
 		return 0;
-		break;
 	}
 
 	/* Get width of command string. */
@@ -1093,22 +1140,20 @@ static char *command_generator(const char *text, int state)
 		if (vline == NULL)
 			return NULL;
 
-		if (rl_end && isspace((int)rl_line_buffer[rl_end - 1]))
+		if (rl_end &&
+		    isspace((unsigned char)rl_line_buffer[rl_end - 1]))
 			vector_set(vline, NULL);
 
 		matched = cmd_complete_command(vline, vty, &complete_status);
 		cmd_free_strvec(vline);
 	}
 
-	if (matched && matched[index])
-		/*
-		 * this is free()'d by readline, but we leak 1 count of
-		 * MTYPE_COMPLETION
-		 */
+	if (matched && matched[index]) {
+		XCOUNTFREE(MTYPE_COMPLETION, matched[index]);
 		return matched[index++];
+	}
 
 	XFREE(MTYPE_TMP, matched);
-	matched = NULL;
 
 	return NULL;
 }
@@ -1130,144 +1175,463 @@ static char **new_completion(const char *text, int start, int end)
 }
 
 /* Vty node structures. */
+#ifdef HAVE_BGPD
 static struct cmd_node bgp_node = {
-	BGP_NODE, "%s(config-router)# ",
+	.name = "bgp",
+	.node = BGP_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-router)# ",
 };
+#endif /* HAVE_BGPD */
 
 static struct cmd_node rip_node = {
-	RIP_NODE, "%s(config-router)# ",
+	.name = "rip",
+	.node = RIP_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-router)# ",
 };
 
+#ifdef HAVE_ISISD
 static struct cmd_node isis_node = {
-	ISIS_NODE, "%s(config-router)# ",
+	.name = "isis",
+	.node = ISIS_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-router)# ",
 };
+#endif /* HAVE_ISISD */
 
+#ifdef HAVE_FABRICD
 static struct cmd_node openfabric_node = {
-	OPENFABRIC_NODE, "%s(config-router)# ",
+	.name = "openfabric",
+	.node = OPENFABRIC_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-router)# ",
 };
+#endif /* HAVE_FABRICD */
 
 static struct cmd_node interface_node = {
-	INTERFACE_NODE, "%s(config-if)# ",
+	.name = "interface",
+	.node = INTERFACE_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-if)# ",
 };
 
 static struct cmd_node pw_node = {
-	PW_NODE, "%s(config-pw)# ",
+	.name = "pw",
+	.node = PW_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-pw)# ",
 };
 
-static struct cmd_node logicalrouter_node = {
-	LOGICALROUTER_NODE, "%s(config-logical-router)# ",
+static struct cmd_node segment_routing_node = {
+	.name = "segment-routing",
+	.node = SEGMENT_ROUTING_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-sr)# ",
 };
+
+#if defined(HAVE_PATHD)
+static struct cmd_node sr_traffic_eng_node = {
+	.name = "sr traffic-eng",
+	.node = SR_TRAFFIC_ENG_NODE,
+	.parent_node = SEGMENT_ROUTING_NODE,
+	.prompt = "%s(config-sr-te)# ",
+};
+
+static struct cmd_node srte_segment_list_node = {
+	.name = "srte segment-list",
+	.node = SR_SEGMENT_LIST_NODE,
+	.parent_node = SR_TRAFFIC_ENG_NODE,
+	.prompt = "%s(config-sr-te-segment-list)# ",
+};
+
+static struct cmd_node srte_policy_node = {
+	.name = "srte policy",
+	.node = SR_POLICY_NODE,
+	.parent_node = SR_TRAFFIC_ENG_NODE,
+	.prompt = "%s(config-sr-te-policy)# ",
+};
+
+static struct cmd_node srte_candidate_dyn_node = {
+	.name = "srte candidate-dyn",
+	.node = SR_CANDIDATE_DYN_NODE,
+	.parent_node = SR_POLICY_NODE,
+	.prompt = "%s(config-sr-te-candidate)# ",
+};
+
+static struct cmd_node pcep_node = {
+	.name = "srte pcep",
+	.node = PCEP_NODE,
+	.parent_node = SR_TRAFFIC_ENG_NODE,
+	.prompt = "%s(config-sr-te-pcep)# "
+};
+
+static struct cmd_node pcep_pcc_node = {
+	.name = "srte pcep pcc",
+	.node = PCEP_PCC_NODE,
+	.parent_node = PCEP_NODE,
+	.prompt = "%s(config-sr-te-pcep-pcc)# ",
+};
+
+static struct cmd_node pcep_pce_node = {
+	.name = "srte pcep pce-peer",
+	.node = PCEP_PCE_NODE,
+	.parent_node = PCEP_NODE,
+	.prompt = "%s(config-sr-te-pcep-pce-peer)# ",
+};
+
+static struct cmd_node pcep_pce_config_node = {
+	.name = "srte pcep pce-config",
+	.node = PCEP_PCE_CONFIG_NODE,
+	.parent_node = PCEP_NODE,
+	.prompt = "%s(pcep-sr-te-pcep-pce-config)# ",
+};
+#endif /* HAVE_PATHD */
 
 static struct cmd_node vrf_node = {
-	VRF_NODE, "%s(config-vrf)# ",
+	.name = "vrf",
+	.node = VRF_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-vrf)# ",
 };
 
 static struct cmd_node nh_group_node = {
-	NH_GROUP_NODE,
-	"%s(config-nh-group)# ",
+	.name = "nexthop-group",
+	.node = NH_GROUP_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-nh-group)# ",
 };
 
-static struct cmd_node rmap_node = {RMAP_NODE, "%s(config-route-map)# "};
+static struct cmd_node rmap_node = {
+	.name = "routemap",
+	.node = RMAP_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-route-map)# ",
+};
 
-static struct cmd_node pbr_map_node = {PBRMAP_NODE, "%s(config-pbr-map)# "};
+static struct cmd_node srv6_node = {
+	.name = "srv6",
+	.node = SRV6_NODE,
+	.parent_node = SEGMENT_ROUTING_NODE,
+	.prompt = "%s(config-srv6)# ",
+};
 
-static struct cmd_node zebra_node = {ZEBRA_NODE, "%s(config-router)# "};
+static struct cmd_node srv6_locs_node = {
+	.name = "srv6-locators",
+	.node = SRV6_LOCS_NODE,
+	.parent_node = SRV6_NODE,
+	.prompt = "%s(config-srv6-locators)# ",
+};
 
-static struct cmd_node bgp_vpnv4_node = {BGP_VPNV4_NODE,
-					 "%s(config-router-af)# "};
+static struct cmd_node srv6_loc_node = {
+	.name = "srv6-locator",
+	.node = SRV6_LOC_NODE,
+	.parent_node = SRV6_LOCS_NODE,
+	.prompt = "%s(config-srv6-locator)# ",
+};
 
-static struct cmd_node bgp_vpnv6_node = {BGP_VPNV6_NODE,
-					 "%s(config-router-af)# "};
+#ifdef HAVE_PBRD
+static struct cmd_node pbr_map_node = {
+	.name = "pbr-map",
+	.node = PBRMAP_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-pbr-map)# ",
+};
+#endif /* HAVE_PBRD */
 
-static struct cmd_node bgp_flowspecv4_node = {BGP_FLOWSPECV4_NODE,
-					"%s(config-router-af)# "};
+static struct cmd_node zebra_node = {
+	.name = "zebra",
+	.node = ZEBRA_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-router)# ",
+};
 
-static struct cmd_node bgp_flowspecv6_node = {BGP_FLOWSPECV6_NODE,
-					"%s(config-router-af)# "};
+#ifdef HAVE_BGPD
+static struct cmd_node bgp_vpnv4_node = {
+	.name = "bgp vpnv4",
+	.node = BGP_VPNV4_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
 
-static struct cmd_node bgp_ipv4_node = {BGP_IPV4_NODE,
-					"%s(config-router-af)# "};
+static struct cmd_node bgp_vpnv6_node = {
+	.name = "bgp vpnv6",
+	.node = BGP_VPNV6_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
 
-static struct cmd_node bgp_ipv4m_node = {BGP_IPV4M_NODE,
-					 "%s(config-router-af)# "};
+static struct cmd_node bgp_flowspecv4_node = {
+	.name = "bgp ipv4 flowspec",
+	.node = BGP_FLOWSPECV4_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
 
-static struct cmd_node bgp_ipv4l_node = {BGP_IPV4L_NODE,
-					 "%s(config-router-af)# "};
+static struct cmd_node bgp_flowspecv6_node = {
+	.name = "bgp ipv6 flowspec",
+	.node = BGP_FLOWSPECV6_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
 
-static struct cmd_node bgp_ipv6_node = {BGP_IPV6_NODE,
-					"%s(config-router-af)# "};
+static struct cmd_node bgp_ipv4_node = {
+	.name = "bgp ipv4 unicast",
+	.node = BGP_IPV4_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
 
-static struct cmd_node bgp_ipv6m_node = {BGP_IPV6M_NODE,
-					 "%s(config-router-af)# "};
+static struct cmd_node bgp_ipv4m_node = {
+	.name = "bgp ipv4 multicast",
+	.node = BGP_IPV4M_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
 
-static struct cmd_node bgp_evpn_node = {BGP_EVPN_NODE,
-					"%s(config-router-af)# "};
+static struct cmd_node bgp_ipv4l_node = {
+	.name = "bgp ipv4 labeled unicast",
+	.node = BGP_IPV4L_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
 
-static struct cmd_node bgp_evpn_vni_node = {BGP_EVPN_VNI_NODE,
-					    "%s(config-router-af-vni)# "};
+static struct cmd_node bgp_ipv6_node = {
+	.name = "bgp ipv6",
+	.node = BGP_IPV6_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
 
-static struct cmd_node bgp_ipv6l_node = {BGP_IPV6L_NODE,
-					 "%s(config-router-af)# "};
+static struct cmd_node bgp_ipv6m_node = {
+	.name = "bgp ipv6 multicast",
+	.node = BGP_IPV6M_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
 
+static struct cmd_node bgp_evpn_node = {
+	.name = "bgp evpn",
+	.node = BGP_EVPN_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
+
+static struct cmd_node bgp_evpn_vni_node = {
+	.name = "bgp evpn vni",
+	.node = BGP_EVPN_VNI_NODE,
+	.parent_node = BGP_EVPN_NODE,
+	.prompt = "%s(config-router-af-vni)# ",
+};
+
+static struct cmd_node bgp_ipv6l_node = {
+	.name = "bgp ipv6 labeled unicast",
+	.node = BGP_IPV6L_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af)# ",
+	.no_xpath = true,
+};
+
+#ifdef ENABLE_BGP_VNC
 static struct cmd_node bgp_vnc_defaults_node = {
-	BGP_VNC_DEFAULTS_NODE, "%s(config-router-vnc-defaults)# "};
+	.name = "bgp vnc defaults",
+	.node = BGP_VNC_DEFAULTS_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-vnc-defaults)# ",
+};
 
 static struct cmd_node bgp_vnc_nve_group_node = {
-	BGP_VNC_NVE_GROUP_NODE, "%s(config-router-vnc-nve-group)# "};
-
-static struct cmd_node bgp_vrf_policy_node = {BGP_VRF_POLICY_NODE,
-					      "%s(config-router-vrf-policy)# "};
-
-static struct cmd_node bgp_vnc_l2_group_node = {
-	BGP_VNC_L2_GROUP_NODE, "%s(config-router-vnc-l2-group)# "};
-
-static struct cmd_node ospf_node = {OSPF_NODE, "%s(config-router)# "};
-
-static struct cmd_node eigrp_node = {EIGRP_NODE, "%s(config-router)# "};
-
-static struct cmd_node babel_node = {BABEL_NODE, "%s(config-router)# "};
-
-static struct cmd_node ripng_node = {RIPNG_NODE, "%s(config-router)# "};
-
-static struct cmd_node ospf6_node = {OSPF6_NODE, "%s(config-ospf6)# "};
-
-static struct cmd_node ldp_node = {LDP_NODE, "%s(config-ldp)# "};
-
-static struct cmd_node ldp_ipv4_node = {LDP_IPV4_NODE, "%s(config-ldp-af)# "};
-
-static struct cmd_node ldp_ipv6_node = {LDP_IPV6_NODE, "%s(config-ldp-af)# "};
-
-static struct cmd_node ldp_ipv4_iface_node = {LDP_IPV4_IFACE_NODE,
-					      "%s(config-ldp-af-if)# "};
-
-static struct cmd_node ldp_ipv6_iface_node = {LDP_IPV6_IFACE_NODE,
-					      "%s(config-ldp-af-if)# "};
-
-static struct cmd_node ldp_l2vpn_node = {LDP_L2VPN_NODE, "%s(config-l2vpn)# "};
-
-static struct cmd_node ldp_pseudowire_node = {LDP_PSEUDOWIRE_NODE,
-					      "%s(config-l2vpn-pw)# "};
-
-static struct cmd_node keychain_node = {KEYCHAIN_NODE, "%s(config-keychain)# "};
-
-static struct cmd_node keychain_key_node = {KEYCHAIN_KEY_NODE,
-					    "%s(config-keychain-key)# "};
-
-struct cmd_node link_params_node = {
-	LINK_PARAMS_NODE, "%s(config-link-params)# ",
+	.name = "bgp vnc nve",
+	.node = BGP_VNC_NVE_GROUP_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-vnc-nve-group)# ",
 };
 
-static struct cmd_node rpki_node = {RPKI_NODE, "%s(config-rpki)# ", 1};
+static struct cmd_node bgp_vrf_policy_node = {
+	.name = "bgp vrf policy",
+	.node = BGP_VRF_POLICY_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-vrf-policy)# ",
+};
+
+static struct cmd_node bgp_vnc_l2_group_node = {
+	.name = "bgp vnc l2",
+	.node = BGP_VNC_L2_GROUP_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-vnc-l2-group)# ",
+};
+#endif /* ENABLE_BGP_VNC */
+
+static struct cmd_node bmp_node = {
+	.name = "bmp",
+	.node = BMP_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-bgp-bmp)# "
+};
+
+static struct cmd_node bgp_srv6_node = {
+	.name = "bgp srv6",
+	.node = BGP_SRV6_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-srv6)# ",
+};
+#endif /* HAVE_BGPD */
+
+#ifdef HAVE_OSPFD
+static struct cmd_node ospf_node = {
+	.name = "ospf",
+	.node = OSPF_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-router)# ",
+};
+#endif /* HAVE_OSPFD */
+
+#ifdef HAVE_EIGRPD
+static struct cmd_node eigrp_node = {
+	.name = "eigrp",
+	.node = EIGRP_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-router)# ",
+};
+#endif /* HAVE_EIGRPD */
+
+#ifdef HAVE_BABELD
+static struct cmd_node babel_node = {
+	.name = "babel",
+	.node = BABEL_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-router)# ",
+};
+#endif /* HAVE_BABELD */
+
+static struct cmd_node ripng_node = {
+	.name = "ripng",
+	.node = RIPNG_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-router)# ",
+};
+
+#ifdef HAVE_OSPF6D
+static struct cmd_node ospf6_node = {
+	.name = "ospf6",
+	.node = OSPF6_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-ospf6)# ",
+};
+#endif /* HAVE_OSPF6D */
+
+#ifdef HAVE_LDPD
+static struct cmd_node ldp_node = {
+	.name = "ldp",
+	.node = LDP_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-ldp)# ",
+};
+
+static struct cmd_node ldp_ipv4_node = {
+	.name = "ldp ipv4",
+	.node = LDP_IPV4_NODE,
+	.parent_node = LDP_NODE,
+	.prompt = "%s(config-ldp-af)# ",
+};
+
+static struct cmd_node ldp_ipv6_node = {
+	.name = "ldp ipv6",
+	.node = LDP_IPV6_NODE,
+	.parent_node = LDP_NODE,
+	.prompt = "%s(config-ldp-af)# ",
+};
+
+static struct cmd_node ldp_ipv4_iface_node = {
+	.name = "ldp ipv4 interface",
+	.node = LDP_IPV4_IFACE_NODE,
+	.parent_node = LDP_IPV4_NODE,
+	.prompt = "%s(config-ldp-af-if)# ",
+};
+
+static struct cmd_node ldp_ipv6_iface_node = {
+	.name = "ldp ipv6 interface",
+	.node = LDP_IPV6_IFACE_NODE,
+	.parent_node = LDP_IPV6_NODE,
+	.prompt = "%s(config-ldp-af-if)# ",
+};
+
+static struct cmd_node ldp_l2vpn_node = {
+	.name = "ldp l2vpn",
+	.node = LDP_L2VPN_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-l2vpn)# ",
+};
+
+static struct cmd_node ldp_pseudowire_node = {
+	.name = "ldp",
+	.node = LDP_PSEUDOWIRE_NODE,
+	.parent_node = LDP_L2VPN_NODE,
+	.prompt = "%s(config-l2vpn-pw)# ",
+};
+#endif /* HAVE_LDPD */
+
+static struct cmd_node keychain_node = {
+	.name = "keychain",
+	.node = KEYCHAIN_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-keychain)# ",
+};
+
+static struct cmd_node keychain_key_node = {
+	.name = "keychain key",
+	.node = KEYCHAIN_KEY_NODE,
+	.parent_node = KEYCHAIN_NODE,
+	.prompt = "%s(config-keychain-key)# ",
+};
+
+struct cmd_node link_params_node = {
+	.name = "link-params",
+	.node = LINK_PARAMS_NODE,
+	.parent_node = INTERFACE_NODE,
+	.prompt = "%s(config-link-params)# ",
+	.no_xpath = true,
+};
+
+#ifdef HAVE_BGPD
+static struct cmd_node rpki_node = {
+	.name = "rpki",
+	.node = RPKI_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-rpki)# ",
+};
+#endif /* HAVE_BGPD */
 
 #if HAVE_BFDD > 0
 static struct cmd_node bfd_node = {
-	BFD_NODE,
-	"%s(config-bfd)# ",
+	.name = "bfd",
+	.node = BFD_NODE,
+	.parent_node = CONFIG_NODE,
+	.prompt = "%s(config-bfd)# ",
 };
 
 static struct cmd_node bfd_peer_node = {
-	BFD_PEER_NODE,
-	"%s(config-bfd-peer)# ",
+	.name = "bfd peer",
+	.node = BFD_PEER_NODE,
+	.parent_node = BFD_NODE,
+	.prompt = "%s(config-bfd-peer)# ",
+};
+
+static struct cmd_node bfd_profile_node = {
+	.name = "bfd profile",
+	.node = BFD_PROFILE_NODE,
+	.parent_node = BFD_NODE,
+	.prompt = "%s(config-bfd-profile)# ",
 };
 #endif /* HAVE_BFDD */
 
@@ -1289,14 +1653,42 @@ static int vtysh_end(void)
 	return CMD_SUCCESS;
 }
 
+#include "vtysh/vtysh_clippy.c"
+
 DEFUNSH(VTYSH_REALLYALL, vtysh_end_all, vtysh_end_all_cmd, "end",
 	"End current mode and change to enable mode\n")
 {
 	return vtysh_end();
 }
 
+DEFUNSH(VTYSH_ZEBRA, srv6, srv6_cmd,
+	"srv6",
+	"Segment-Routing SRv6 configuration\n")
+{
+	vty->node = SRV6_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_ZEBRA, srv6_locators, srv6_locators_cmd,
+	"locators",
+	"Segment-Routing SRv6 locators configuration\n")
+{
+	vty->node = SRV6_LOCS_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_ZEBRA, srv6_locator, srv6_locator_cmd,
+	"locator WORD",
+	"Segment Routing SRv6 locator\n"
+	"Specify locator-name\n")
+{
+	vty->node = SRV6_LOC_NODE;
+	return CMD_SUCCESS;
+}
+
+#ifdef HAVE_BGPD
 DEFUNSH(VTYSH_BGPD, router_bgp, router_bgp_cmd,
-	"router bgp [(1-4294967295) [<view|vrf> WORD]]",
+	"router bgp [(1-4294967295) [<view|vrf> VIEWVRFNAME]]",
 	ROUTER_STR BGP_STR AS_STR
 	"BGP view\nBGP VRF\n"
 	"View/VRF name\n")
@@ -1309,8 +1701,8 @@ DEFUNSH(VTYSH_BGPD, router_bgp, router_bgp_cmd,
 DEFUNSH(VTYSH_BGPD, address_family_vpnv4, address_family_vpnv4_cmd,
 	"address-family vpnv4 [unicast]",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_VPNV4_NODE;
 	return CMD_SUCCESS;
@@ -1319,8 +1711,8 @@ DEFUNSH(VTYSH_BGPD, address_family_vpnv4, address_family_vpnv4_cmd,
 DEFUNSH(VTYSH_BGPD, address_family_vpnv6, address_family_vpnv6_cmd,
 	"address-family vpnv6 [unicast]",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_VPNV6_NODE;
 	return CMD_SUCCESS;
@@ -1330,8 +1722,8 @@ DEFUNSH(VTYSH_BGPD, address_family_vpnv6, address_family_vpnv6_cmd,
 DEFUNSH(VTYSH_BGPD, address_family_ipv4, address_family_ipv4_cmd,
 	"address-family ipv4 [unicast]",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family Modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_IPV4_NODE;
 	return CMD_SUCCESS;
@@ -1340,8 +1732,8 @@ DEFUNSH(VTYSH_BGPD, address_family_ipv4, address_family_ipv4_cmd,
 DEFUNSH(VTYSH_BGPD, address_family_flowspecv4, address_family_flowspecv4_cmd,
 	"address-family ipv4 flowspec",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family Modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_FLOWSPECV4_NODE;
 	return CMD_SUCCESS;
@@ -1350,8 +1742,8 @@ DEFUNSH(VTYSH_BGPD, address_family_flowspecv4, address_family_flowspecv4_cmd,
 DEFUNSH(VTYSH_BGPD, address_family_flowspecv6, address_family_flowspecv6_cmd,
 	"address-family ipv6 flowspec",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family Modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_FLOWSPECV6_NODE;
 	return CMD_SUCCESS;
@@ -1360,8 +1752,8 @@ DEFUNSH(VTYSH_BGPD, address_family_flowspecv6, address_family_flowspecv6_cmd,
 DEFUNSH(VTYSH_BGPD, address_family_ipv4_multicast,
 	address_family_ipv4_multicast_cmd, "address-family ipv4 multicast",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_IPV4M_NODE;
 	return CMD_SUCCESS;
@@ -1370,8 +1762,8 @@ DEFUNSH(VTYSH_BGPD, address_family_ipv4_multicast,
 DEFUNSH(VTYSH_BGPD, address_family_ipv4_vpn, address_family_ipv4_vpn_cmd,
 	"address-family ipv4 vpn",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_VPNV4_NODE;
 	return CMD_SUCCESS;
@@ -1381,8 +1773,8 @@ DEFUNSH(VTYSH_BGPD, address_family_ipv4_labeled_unicast,
 	address_family_ipv4_labeled_unicast_cmd,
 	"address-family ipv4 labeled-unicast",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_IPV4L_NODE;
 	return CMD_SUCCESS;
@@ -1391,8 +1783,8 @@ DEFUNSH(VTYSH_BGPD, address_family_ipv4_labeled_unicast,
 DEFUNSH(VTYSH_BGPD, address_family_ipv6, address_family_ipv6_cmd,
 	"address-family ipv6 [unicast]",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_IPV6_NODE;
 	return CMD_SUCCESS;
@@ -1401,8 +1793,8 @@ DEFUNSH(VTYSH_BGPD, address_family_ipv6, address_family_ipv6_cmd,
 DEFUNSH(VTYSH_BGPD, address_family_ipv6_multicast,
 	address_family_ipv6_multicast_cmd, "address-family ipv6 multicast",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_IPV6M_NODE;
 	return CMD_SUCCESS;
@@ -1411,8 +1803,8 @@ DEFUNSH(VTYSH_BGPD, address_family_ipv6_multicast,
 DEFUNSH(VTYSH_BGPD, address_family_ipv6_vpn, address_family_ipv6_vpn_cmd,
 	"address-family ipv6 vpn",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_VPNV6_NODE;
 	return CMD_SUCCESS;
@@ -1422,8 +1814,8 @@ DEFUNSH(VTYSH_BGPD, address_family_ipv6_labeled_unicast,
 	address_family_ipv6_labeled_unicast_cmd,
 	"address-family ipv6 labeled-unicast",
 	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family modifier\n")
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_IPV6L_NODE;
 	return CMD_SUCCESS;
@@ -1439,26 +1831,60 @@ DEFUNSH(VTYSH_BGPD,
 	return CMD_SUCCESS;
 }
 
-DEFUNSH(VTYSH_BGPD, address_family_evpn, address_family_evpn_cmd,
-	"address-family <l2vpn evpn>",
-	"Enter Address Family command mode\n"
-	"Address Family\n"
-	"Address Family modifier\n")
+DEFUNSH(VTYSH_BGPD,
+	bmp_targets,
+	bmp_targets_cmd,
+	"bmp targets BMPTARGETS",
+	"BGP Monitoring Protocol\n"
+	"Create BMP target group\n"
+	"Name of the BMP target group\n")
 {
-	vty->node = BGP_EVPN_NODE;
+	vty->node = BMP_NODE;
 	return CMD_SUCCESS;
 }
 
-#if defined(HAVE_CUMULUS)
-DEFUNSH_HIDDEN(VTYSH_BGPD, address_family_evpn2, address_family_evpn2_cmd,
-	       "address-family evpn",
-	       "Enter Address Family command mode\n"
-	       "EVPN Address family\n")
+DEFUNSH(VTYSH_BGPD,
+        bgp_srv6,
+        bgp_srv6_cmd,
+        "segment-routing srv6",
+        "Segment-Routing configuration\n"
+        "Segment-Routing SRv6 configuration\n")
+{
+	vty->node = BGP_SRV6_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_BGPD,
+        exit_bgp_srv6,
+        exit_bgp_srv6_cmd,
+        "exit",
+        "exit Segment-Routing SRv6 configuration\n")
+{
+	if (vty->node == BGP_SRV6_NODE)
+		vty->node = BGP_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_BGPD,
+        quit_bgp_srv6,
+        quit_bgp_srv6_cmd,
+        "quit",
+        "quit Segment-Routing SRv6 configuration\n")
+{
+	if (vty->node == BGP_SRV6_NODE)
+		vty->node = BGP_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_BGPD, address_family_evpn, address_family_evpn_cmd,
+	"address-family <l2vpn evpn>",
+	"Enter Address Family command mode\n"
+	BGP_AF_STR
+	BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_EVPN_NODE;
 	return CMD_SUCCESS;
 }
-#endif
 
 DEFUNSH(VTYSH_BGPD, bgp_evpn_vni, bgp_evpn_vni_cmd, "vni " CMD_VNI_RANGE,
 	"VXLAN Network Identifier\n"
@@ -1502,7 +1928,26 @@ DEFUNSH(VTYSH_BGPD, vnc_l2_group, vnc_l2_group_cmd, "vnc l2-group NAME",
 	vty->node = BGP_VNC_L2_GROUP_NODE;
 	return CMD_SUCCESS;
 }
+
+DEFUNSH(VTYSH_BGPD, exit_vnc_config, exit_vnc_config_cmd, "exit-vnc",
+	"Exit from VNC configuration mode\n")
+{
+	if (vty->node == BGP_VNC_DEFAULTS_NODE
+	    || vty->node == BGP_VNC_NVE_GROUP_NODE
+	    || vty->node == BGP_VNC_L2_GROUP_NODE)
+		vty->node = BGP_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_BGPD, exit_vrf_policy, exit_vrf_policy_cmd, "exit-vrf-policy",
+	"Exit from VRF policy configuration mode\n")
+{
+	if (vty->node == BGP_VRF_POLICY_NODE)
+		vty->node = BGP_NODE;
+	return CMD_SUCCESS;
+}
 #endif
+#endif /* HAVE_BGPD */
 
 DEFUNSH(VTYSH_KEYS, key_chain, key_chain_cmd, "key chain WORD",
 	"Authentication key management\n"
@@ -1521,20 +1966,25 @@ DEFUNSH(VTYSH_KEYS, key, key_cmd, "key (0-2147483647)",
 	return CMD_SUCCESS;
 }
 
+#ifdef HAVE_RIPD
 DEFUNSH(VTYSH_RIPD, router_rip, router_rip_cmd, "router rip [vrf NAME]",
 	ROUTER_STR "RIP\n" VRF_CMD_HELP_STR)
 {
 	vty->node = RIP_NODE;
 	return CMD_SUCCESS;
 }
+#endif /* HAVE_RIPD */
 
+#ifdef HAVE_RIPNGD
 DEFUNSH(VTYSH_RIPNGD, router_ripng, router_ripng_cmd, "router ripng [vrf NAME]",
 	ROUTER_STR "RIPng\n" VRF_CMD_HELP_STR)
 {
 	vty->node = RIPNG_NODE;
 	return CMD_SUCCESS;
 }
+#endif /* HAVE_RIPNGD */
 
+#ifdef HAVE_OSPFD
 DEFUNSH(VTYSH_OSPFD, router_ospf, router_ospf_cmd,
 	"router ospf [(1-65535)] [vrf NAME]",
 	"Enable a routing process\n"
@@ -1545,16 +1995,21 @@ DEFUNSH(VTYSH_OSPFD, router_ospf, router_ospf_cmd,
 	vty->node = OSPF_NODE;
 	return CMD_SUCCESS;
 }
+#endif /* HAVE_OSPFD */
 
-DEFUNSH(VTYSH_EIGRPD, router_eigrp, router_eigrp_cmd, "router eigrp (1-65535)",
+#ifdef HAVE_EIGRPD
+DEFUNSH(VTYSH_EIGRPD, router_eigrp, router_eigrp_cmd, "router eigrp (1-65535) [vrf NAME]",
 	"Enable a routing process\n"
 	"Start EIGRP configuration\n"
-	"AS number to use\n")
+	"AS number to use\n"
+	VRF_CMD_HELP_STR)
 {
 	vty->node = EIGRP_NODE;
 	return CMD_SUCCESS;
 }
+#endif /* HAVE_EIGRPD */
 
+#ifdef HAVE_BABELD
 DEFUNSH(VTYSH_BABELD, router_babel, router_babel_cmd, "router babel",
 	"Enable a routing process\n"
 	"Make Babel instance command\n")
@@ -1562,13 +2017,16 @@ DEFUNSH(VTYSH_BABELD, router_babel, router_babel_cmd, "router babel",
 	vty->node = BABEL_NODE;
 	return CMD_SUCCESS;
 }
+#endif /* HAVE_BABELD */
 
-DEFUNSH(VTYSH_OSPF6D, router_ospf6, router_ospf6_cmd, "router ospf6",
-	ROUTER_STR OSPF6_STR)
+#ifdef HAVE_OSPF6D
+DEFUNSH(VTYSH_OSPF6D, router_ospf6, router_ospf6_cmd, "router ospf6 [vrf NAME]",
+	ROUTER_STR OSPF6_STR VRF_CMD_HELP_STR)
 {
 	vty->node = OSPF6_NODE;
 	return CMD_SUCCESS;
 }
+#endif
 
 #if defined(HAVE_LDPD)
 DEFUNSH(VTYSH_LDPD, ldp_mpls_ldp, ldp_mpls_ldp_cmd, "mpls ldp",
@@ -1646,15 +2104,19 @@ DEFUNSH(VTYSH_LDPD, ldp_member_pseudowire_ifname,
 }
 #endif
 
-DEFUNSH(VTYSH_ISISD, router_isis, router_isis_cmd, "router isis WORD",
+#ifdef HAVE_ISISD
+DEFUNSH(VTYSH_ISISD, router_isis, router_isis_cmd,
+	"router isis WORD [vrf NAME]",
 	ROUTER_STR
 	"ISO IS-IS\n"
-	"ISO Routing area tag\n")
+	"ISO Routing area tag\n" VRF_CMD_HELP_STR)
 {
 	vty->node = ISIS_NODE;
 	return CMD_SUCCESS;
 }
+#endif /* HAVE_ISISD */
 
+#ifdef HAVE_FABRICD
 DEFUNSH(VTYSH_FABRICD, router_openfabric, router_openfabric_cmd, "router openfabric WORD",
 	ROUTER_STR
 	"OpenFabric routing protocol\n"
@@ -1663,9 +2125,99 @@ DEFUNSH(VTYSH_FABRICD, router_openfabric, router_openfabric_cmd, "router openfab
 	vty->node = OPENFABRIC_NODE;
 	return CMD_SUCCESS;
 }
+#endif /* HAVE_FABRICD */
+
+DEFUNSH(VTYSH_SR, segment_routing, segment_routing_cmd,
+	"segment-routing",
+	"Configure segment routing\n")
+{
+	vty->node = SEGMENT_ROUTING_NODE;
+	return CMD_SUCCESS;
+}
+
+#if defined (HAVE_PATHD)
+DEFUNSH(VTYSH_PATHD, sr_traffic_eng, sr_traffic_eng_cmd,
+	"traffic-eng",
+	"Configure SR traffic engineering\n")
+{
+	vty->node = SR_TRAFFIC_ENG_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_PATHD, srte_segment_list, srte_segment_list_cmd,
+	"segment-list WORD$name",
+	"Segment List\n"
+	"Segment List Name\n")
+{
+	vty->node = SR_SEGMENT_LIST_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_PATHD, srte_policy, srte_policy_cmd,
+	"policy color (0-4294967295) endpoint <A.B.C.D|X:X::X:X>",
+	"Segment Routing Policy\n"
+	"SR Policy color\n"
+	"SR Policy color value\n"
+	"SR Policy endpoint\n"
+	"SR Policy endpoint IPv4 address\n"
+	"SR Policy endpoint IPv6 address\n")
+{
+	vty->node = SR_POLICY_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_PATHD, srte_policy_candidate_dyn_path,
+	srte_policy_candidate_dyn_path_cmd,
+	"candidate-path preference (0-4294967295) name WORD dynamic",
+	"Segment Routing Policy Candidate Path\n"
+	"Segment Routing Policy Candidate Path Preference\n"
+	"Administrative Preference\n"
+	"Segment Routing Policy Candidate Path Name\n"
+	"Symbolic Name\n"
+	"Dynamic Path\n")
+{
+	vty->node = SR_CANDIDATE_DYN_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_PATHD, pcep, pcep_cmd,
+	"pcep",
+	"Configure SR pcep\n")
+{
+	vty->node = PCEP_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_PATHD, pcep_cli_pcc, pcep_cli_pcc_cmd,
+	"pcc",
+	"PCC configuration\n")
+{
+	vty->node = PCEP_PCC_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_PATHD, pcep_cli_pce, pcep_cli_pce_cmd,
+	"pce WORD",
+	"PCE configuration\n"
+	"Peer name\n")
+{
+	vty->node = PCEP_PCE_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_PATHD, pcep_cli_pcep_pce_config, pcep_cli_pcep_pce_config_cmd,
+	"pce-config WORD",
+	"PCEP peer Configuration Group\n"
+	"PCEP peer Configuration Group name\n")
+{
+	vty->node = PCEP_PCE_CONFIG_NODE;
+	return CMD_SUCCESS;
+}
+
+#endif /* HAVE_PATHD */
 
 DEFUNSH(VTYSH_RMAP, vtysh_route_map, vtysh_route_map_cmd,
-	"route-map WORD <deny|permit> (1-65535)",
+	"route-map RMAP_NAME <deny|permit> (1-65535)",
 	"Create route-map or enter route-map command mode\n"
 	"Route map tag\n"
 	"Route map denies set operations\n"
@@ -1676,8 +2228,9 @@ DEFUNSH(VTYSH_RMAP, vtysh_route_map, vtysh_route_map_cmd,
 	return CMD_SUCCESS;
 }
 
+#ifdef HAVE_PBRD
 DEFUNSH(VTYSH_PBRD, vtysh_pbr_map, vtysh_pbr_map_cmd,
-	"pbr-map NAME seq (1-700)",
+	"pbr-map PBRMAP seq (1-700)",
 	"Create pbr-map or enter pbr-map command mode\n"
 	"The name of the PBR MAP\n"
 	"Sequence to insert to/delete from existing pbr-map entry\n"
@@ -1686,6 +2239,14 @@ DEFUNSH(VTYSH_PBRD, vtysh_pbr_map, vtysh_pbr_map_cmd,
 	vty->node = PBRMAP_NODE;
 	return CMD_SUCCESS;
 }
+
+DEFSH(VTYSH_PBRD, vtysh_no_pbr_map_cmd, "no pbr-map PBRMAP [seq (1-700)]",
+	NO_STR
+	"Delete pbr-map\n"
+	"The name of  the PBR MAP\n"
+	"Sequence to delete from existing pbr-map entry\n"
+	"Sequence number\n")
+#endif /* HAVE_PBRD */
 
 #if HAVE_BFDD > 0
 DEFUNSH(VTYSH_BFDD, bfd_enter, bfd_enter_cmd, "bfd", "Configure BFD peers\n")
@@ -1711,14 +2272,16 @@ DEFUNSH(VTYSH_BFDD, bfd_peer_enter, bfd_peer_enter_cmd,
 	vty->node = BFD_PEER_NODE;
 	return CMD_SUCCESS;
 }
-#endif /* HAVE_BFDD */
 
-DEFSH(VTYSH_PBRD, vtysh_no_pbr_map_cmd, "no pbr-map WORD [seq (1-700)]",
-	NO_STR
-	"Delete pbr-map\n"
-	"The name of  the PBR MAP\n"
-	"Sequence to delete from existing pbr-map entry\n"
-	"Sequence number\n")
+DEFUNSH(VTYSH_BFDD, bfd_profile_enter, bfd_profile_enter_cmd,
+	"profile BFDPROF",
+	BFD_PROFILE_STR
+	BFD_PROFILE_NAME_STR)
+{
+	vty->node = BFD_PROFILE_NODE;
+	return CMD_SUCCESS;
+}
+#endif /* HAVE_BFDD */
 
 DEFUNSH(VTYSH_ALL, vtysh_line_vty, vtysh_line_vty_cmd, "line vty",
 	"Configure a terminal line\n"
@@ -1744,7 +2307,7 @@ DEFUNSH(VTYSH_REALLYALL, vtysh_disable, vtysh_disable_cmd, "disable",
 }
 
 DEFUNSH(VTYSH_REALLYALL, vtysh_config_terminal, vtysh_config_terminal_cmd,
-	"configure terminal",
+	"configure [terminal]",
 	"Configuration from vty interface\n"
 	"Configuration terminal\n")
 {
@@ -1754,85 +2317,19 @@ DEFUNSH(VTYSH_REALLYALL, vtysh_config_terminal, vtysh_config_terminal_cmd,
 
 static int vtysh_exit(struct vty *vty)
 {
-	switch (vty->node) {
-	case VIEW_NODE:
-	case ENABLE_NODE:
+	struct cmd_node *cnode = vector_lookup(cmdvec, vty->node);
+
+	if (vty->node == VIEW_NODE || vty->node == ENABLE_NODE)
 		exit(0);
-		break;
-	case CONFIG_NODE:
-		vty->node = ENABLE_NODE;
-		break;
-	case INTERFACE_NODE:
-	case PW_NODE:
-	case LOGICALROUTER_NODE:
-	case VRF_NODE:
-	case NH_GROUP_NODE:
-	case ZEBRA_NODE:
-	case BGP_NODE:
-	case RIP_NODE:
-	case RIPNG_NODE:
-	case OSPF_NODE:
-	case OSPF6_NODE:
-	case EIGRP_NODE:
-	case BABEL_NODE:
-	case LDP_NODE:
-	case LDP_L2VPN_NODE:
-	case ISIS_NODE:
-	case OPENFABRIC_NODE:
-	case RMAP_NODE:
-	case PBRMAP_NODE:
-	case VTY_NODE:
-	case KEYCHAIN_NODE:
-	case BFD_NODE:
-	case RPKI_NODE:
+	if (cnode->node_exit)
+		cnode->node_exit(vty);
+	if (cnode->parent_node)
+		vty->node = cnode->parent_node;
+
+	if (vty->node == CONFIG_NODE) {
+		/* resync in case one of the daemons is somewhere else */
 		vtysh_execute("end");
-		vtysh_execute("configure terminal");
-		vty->node = CONFIG_NODE;
-		break;
-	case BGP_VPNV4_NODE:
-	case BGP_VPNV6_NODE:
-	case BGP_IPV4_NODE:
-	case BGP_IPV4M_NODE:
-	case BGP_IPV4L_NODE:
-	case BGP_IPV6_NODE:
-	case BGP_IPV6M_NODE:
-	case BGP_IPV6L_NODE:
-	case BGP_FLOWSPECV4_NODE:
-	case BGP_FLOWSPECV6_NODE:
-	case BGP_VRF_POLICY_NODE:
-	case BGP_EVPN_NODE:
-	case BGP_VNC_DEFAULTS_NODE:
-	case BGP_VNC_NVE_GROUP_NODE:
-	case BGP_VNC_L2_GROUP_NODE:
-		vty->node = BGP_NODE;
-		break;
-	case BGP_EVPN_VNI_NODE:
-		vty->node = BGP_EVPN_NODE;
-		break;
-	case LDP_IPV4_NODE:
-	case LDP_IPV6_NODE:
-		vty->node = LDP_NODE;
-		break;
-	case LDP_IPV4_IFACE_NODE:
-		vty->node = LDP_IPV4_NODE;
-		break;
-	case LDP_IPV6_IFACE_NODE:
-		vty->node = LDP_IPV6_NODE;
-		break;
-	case LDP_PSEUDOWIRE_NODE:
-		vty->node = LDP_L2VPN_NODE;
-		break;
-	case KEYCHAIN_KEY_NODE:
-		vty->node = KEYCHAIN_NODE;
-		break;
-	case LINK_PARAMS_NODE:
-		vty->node = INTERFACE_NODE;
-		break;
-	case BFD_PEER_NODE:
-		vty->node = BFD_NODE;
-		break;
-	default:
-		break;
+		vtysh_execute("configure");
 	}
 	return CMD_SUCCESS;
 }
@@ -1843,12 +2340,13 @@ DEFUNSH(VTYSH_REALLYALL, vtysh_exit_all, vtysh_exit_all_cmd, "exit",
 	return vtysh_exit(vty);
 }
 
-DEFUNSH(VTYSH_ALL, vtysh_quit_all, vtysh_quit_all_cmd, "quit",
+DEFUNSH(VTYSH_REALLYALL, vtysh_quit_all, vtysh_quit_all_cmd, "quit",
 	"Exit current mode and down to previous mode\n")
 {
 	return vtysh_exit_all(self, vty, argc, argv);
 }
 
+#ifdef HAVE_BGPD
 DEFUNSH(VTYSH_BGPD, exit_address_family, exit_address_family_cmd,
 	"exit-address-family", "Exit from Address Family configuration mode\n")
 {
@@ -1870,17 +2368,6 @@ DEFUNSH(VTYSH_BGPD, exit_vni, exit_vni_cmd, "exit-vni", "Exit from VNI mode\n")
 	return CMD_SUCCESS;
 }
 
-DEFUNSH(VTYSH_BGPD, exit_vnc_config, exit_vnc_config_cmd, "exit-vnc",
-	"Exit from VNC configuration mode\n")
-{
-	if (vty->node == BGP_VNC_DEFAULTS_NODE
-	    || vty->node == BGP_VNC_NVE_GROUP_NODE
-	    || vty->node == BGP_VNC_L2_GROUP_NODE)
-		vty->node = BGP_NODE;
-	return CMD_SUCCESS;
-
-}
-
 DEFUNSH(VTYSH_BGPD, rpki_exit, rpki_exit_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
 {
@@ -1894,7 +2381,21 @@ DEFUNSH(VTYSH_BGPD, rpki_quit, rpki_quit_cmd, "quit",
 	return rpki_exit(self, vty, argc, argv);
 }
 
-DEFUNSH(VTYSH_PIMD|VTYSH_ZEBRA, exit_vrf_config, exit_vrf_config_cmd, "exit-vrf",
+DEFUNSH(VTYSH_BGPD, bmp_exit, bmp_exit_cmd, "exit",
+	"Exit current mode and down to previous mode\n")
+{
+	vtysh_exit(vty);
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_BGPD, bmp_quit, bmp_quit_cmd, "quit",
+	"Exit current mode and down to previous mode\n")
+{
+	return bmp_exit(self, vty, argc, argv);
+}
+#endif /* HAVE_BGPD */
+
+DEFUNSH(VTYSH_VRF, exit_vrf_config, exit_vrf_config_cmd, "exit-vrf",
 	"Exit from VRF configuration mode\n")
 {
 	if (vty->node == VRF_NODE)
@@ -1902,14 +2403,31 @@ DEFUNSH(VTYSH_PIMD|VTYSH_ZEBRA, exit_vrf_config, exit_vrf_config_cmd, "exit-vrf"
 	return CMD_SUCCESS;
 }
 
-DEFUNSH(VTYSH_BGPD, exit_vrf_policy, exit_vrf_policy_cmd, "exit-vrf-policy",
-	"Exit from VRF policy configuration mode\n")
+DEFUNSH(VTYSH_ZEBRA, exit_srv6_config, exit_srv6_config_cmd, "exit",
+	"Exit from SRv6 configuration mode\n")
 {
-	if (vty->node == BGP_VRF_POLICY_NODE)
-		vty->node = BGP_NODE;
+	if (vty->node == SRV6_NODE)
+		vty->node = SEGMENT_ROUTING_NODE;
 	return CMD_SUCCESS;
 }
 
+DEFUNSH(VTYSH_ZEBRA, exit_srv6_locs_config, exit_srv6_locs_config_cmd, "exit",
+	"Exit from SRv6-locator configuration mode\n")
+{
+	if (vty->node == SRV6_LOCS_NODE)
+		vty->node = SRV6_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_ZEBRA, exit_srv6_loc_config, exit_srv6_loc_config_cmd, "exit",
+	"Exit from SRv6-locators configuration mode\n")
+{
+	if (vty->node == SRV6_LOC_NODE)
+		vty->node = SRV6_LOCS_NODE;
+	return CMD_SUCCESS;
+}
+
+#ifdef HAVE_RIPD
 DEFUNSH(VTYSH_RIPD, vtysh_exit_ripd, vtysh_exit_ripd_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
 {
@@ -1921,7 +2439,9 @@ DEFUNSH(VTYSH_RIPD, vtysh_quit_ripd, vtysh_quit_ripd_cmd, "quit",
 {
 	return vtysh_exit_ripd(self, vty, argc, argv);
 }
+#endif /* HAVE_RIPD */
 
+#ifdef HAVE_RIPNGD
 DEFUNSH(VTYSH_RIPNGD, vtysh_exit_ripngd, vtysh_exit_ripngd_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
 {
@@ -1933,6 +2453,7 @@ DEFUNSH(VTYSH_RIPNGD, vtysh_quit_ripngd, vtysh_quit_ripngd_cmd, "quit",
 {
 	return vtysh_exit_ripngd(self, vty, argc, argv);
 }
+#endif /* HAVE_RIPNGD */
 
 DEFUNSH(VTYSH_RMAP, vtysh_exit_rmap, vtysh_exit_rmap_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
@@ -1946,6 +2467,7 @@ DEFUNSH(VTYSH_RMAP, vtysh_quit_rmap, vtysh_quit_rmap_cmd, "quit",
 	return vtysh_exit_rmap(self, vty, argc, argv);
 }
 
+#ifdef HAVE_PBRD
 DEFUNSH(VTYSH_PBRD, vtysh_exit_pbr_map, vtysh_exit_pbr_map_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
 {
@@ -1957,7 +2479,9 @@ DEFUNSH(VTYSH_PBRD, vtysh_quit_pbr_map, vtysh_quit_pbr_map_cmd, "quit",
 {
 	return vtysh_exit_rmap(self, vty, argc, argv);
 }
+#endif /* HAVE_PBRD */
 
+#ifdef HAVE_BGPD
 DEFUNSH(VTYSH_BGPD, vtysh_exit_bgpd, vtysh_exit_bgpd_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
 {
@@ -1969,7 +2493,9 @@ DEFUNSH(VTYSH_BGPD, vtysh_quit_bgpd, vtysh_quit_bgpd_cmd, "quit",
 {
 	return vtysh_exit_bgpd(self, vty, argc, argv);
 }
+#endif /* HAVE_BGPD */
 
+#ifdef HAVE_OSPFD
 DEFUNSH(VTYSH_OSPFD, vtysh_exit_ospfd, vtysh_exit_ospfd_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
 {
@@ -1981,7 +2507,9 @@ DEFUNSH(VTYSH_OSPFD, vtysh_quit_ospfd, vtysh_quit_ospfd_cmd, "quit",
 {
 	return vtysh_exit_ospfd(self, vty, argc, argv);
 }
+#endif /* HAVE_OSPFD */
 
+#ifdef HAVE_EIGRPD
 DEFUNSH(VTYSH_EIGRPD, vtysh_exit_eigrpd, vtysh_exit_eigrpd_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
 {
@@ -1993,8 +2521,10 @@ DEFUNSH(VTYSH_EIGRPD, vtysh_quit_eigrpd, vtysh_quit_eigrpd_cmd, "quit",
 {
 	return vtysh_exit(vty);
 }
+#endif /* HAVE_EIGRPD */
 
-DEFUNSH(VTYSH_EIGRPD, vtysh_exit_babeld, vtysh_exit_babeld_cmd, "exit",
+#ifdef HAVE_BABELD
+DEFUNSH(VTYSH_BABELD, vtysh_exit_babeld, vtysh_exit_babeld_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
 {
 	return vtysh_exit(vty);
@@ -2005,7 +2535,9 @@ DEFUNSH(VTYSH_BABELD, vtysh_quit_babeld, vtysh_quit_babeld_cmd, "quit",
 {
 	return vtysh_exit(vty);
 }
+#endif /* HAVE_BABELD */
 
+#ifdef HAVE_OSPF6D
 DEFUNSH(VTYSH_OSPF6D, vtysh_exit_ospf6d, vtysh_exit_ospf6d_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
 {
@@ -2017,6 +2549,7 @@ DEFUNSH(VTYSH_OSPF6D, vtysh_quit_ospf6d, vtysh_quit_ospf6d_cmd, "quit",
 {
 	return vtysh_exit_ospf6d(self, vty, argc, argv);
 }
+#endif /* HAVE_OSPF6D */
 
 #if defined(HAVE_LDPD)
 DEFUNSH(VTYSH_LDPD, vtysh_exit_ldpd, vtysh_exit_ldpd_cmd, "exit",
@@ -2029,6 +2562,7 @@ ALIAS(vtysh_exit_ldpd, vtysh_quit_ldpd_cmd, "quit",
       "Exit current mode and down to previous mode\n")
 #endif
 
+#ifdef HAVE_ISISD
 DEFUNSH(VTYSH_ISISD, vtysh_exit_isisd, vtysh_exit_isisd_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
 {
@@ -2040,6 +2574,7 @@ DEFUNSH(VTYSH_ISISD, vtysh_quit_isisd, vtysh_quit_isisd_cmd, "quit",
 {
 	return vtysh_exit_isisd(self, vty, argc, argv);
 }
+#endif /* HAVE_ISISD */
 
 #if HAVE_BFDD > 0
 DEFUNSH(VTYSH_BFDD, vtysh_exit_bfdd, vtysh_exit_bfdd_cmd, "exit",
@@ -2052,6 +2587,7 @@ ALIAS(vtysh_exit_bfdd, vtysh_quit_bfdd_cmd, "quit",
       "Exit current mode and down to previous mode\n")
 #endif
 
+#ifdef HAVE_FABRICD
 DEFUNSH(VTYSH_FABRICD, vtysh_exit_fabricd, vtysh_exit_fabricd_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
 {
@@ -2063,6 +2599,45 @@ DEFUNSH(VTYSH_FABRICD, vtysh_quit_fabricd, vtysh_quit_fabricd_cmd, "quit",
 {
 	return vtysh_exit_fabricd(self, vty, argc, argv);
 }
+#endif /* HAVE_FABRICD */
+
+DEFUNSH(VTYSH_KEYS, vtysh_exit_keys, vtysh_exit_keys_cmd, "exit",
+	"Exit current mode and down to previous mode\n")
+{
+	return vtysh_exit(vty);
+}
+
+DEFUNSH(VTYSH_KEYS, vtysh_quit_keys, vtysh_quit_keys_cmd, "quit",
+	"Exit current mode and down to previous mode\n")
+{
+	return vtysh_exit_keys(self, vty, argc, argv);
+}
+
+DEFUNSH(VTYSH_SR, vtysh_exit_sr, vtysh_exit_sr_cmd, "exit",
+	"Exit current mode and down to previous mode\n")
+{
+	return vtysh_exit(vty);
+}
+
+DEFUNSH(VTYSH_SR, vtysh_quit_sr, vtysh_quit_sr_cmd, "quit",
+	"Exit current mode and down to previous mode\n")
+{
+	return vtysh_exit(vty);
+}
+
+#if defined(HAVE_PATHD)
+DEFUNSH(VTYSH_PATHD, vtysh_exit_pathd, vtysh_exit_pathd_cmd, "exit",
+	"Exit current mode and down to previous mode\n")
+{
+	return vtysh_exit(vty);
+}
+
+DEFUNSH(VTYSH_PATHD, vtysh_quit_pathd, vtysh_quit_pathd_cmd, "quit",
+	"Exit current mode and down to previous mode\n")
+{
+	return vtysh_exit_pathd(self, vty, argc, argv);
+}
+#endif /* HAVE_PATHD */
 
 DEFUNSH(VTYSH_ALL, vtysh_exit_line_vty, vtysh_exit_line_vty_cmd, "exit",
 	"Exit current mode and down to previous mode\n")
@@ -2094,26 +2669,9 @@ DEFUNSH(VTYSH_ZEBRA, vtysh_pseudowire, vtysh_pseudowire_cmd,
 	return CMD_SUCCESS;
 }
 
-DEFUNSH(VTYSH_ZEBRA, vtysh_logicalrouter, vtysh_logicalrouter_cmd,
-	"logical-router (1-65535) ns NAME",
-	"Enable a logical-router\n"
-	"Specify the logical-router indentifier\n"
-	"The Name Space\n"
-	"The file name in " NS_RUN_DIR ", or a full pathname\n")
-{
-	vty->node = LOGICALROUTER_NODE;
-	return CMD_SUCCESS;
-}
-
-DEFSH(VTYSH_ZEBRA, vtysh_no_logicalrouter_cmd,
-      "no logical-router (1-65535) ns NAME", NO_STR
-      "Enable a Logical-Router\n"
-      "Specify the Logical-Router identifier\n"
-      "The Name Space\n"
-      "The file name in " NS_RUN_DIR ", or a full pathname\n")
-
-DEFUNSH(VTYSH_PBRD | VTYSH_SHARPD, vtysh_nexthop_group, vtysh_nexthop_group_cmd,
-	"nexthop-group NAME",
+DEFUNSH(VTYSH_NH_GROUP,
+	vtysh_nexthop_group, vtysh_nexthop_group_cmd,
+	"nexthop-group NHGNAME",
 	"Nexthop Group configuration\n"
 	"Name of the Nexthop Group\n")
 {
@@ -2121,8 +2679,8 @@ DEFUNSH(VTYSH_PBRD | VTYSH_SHARPD, vtysh_nexthop_group, vtysh_nexthop_group_cmd,
 	return CMD_SUCCESS;
 }
 
-DEFSH(VTYSH_PBRD | VTYSH_SHARPD, vtysh_no_nexthop_group_cmd,
-      "no nexthop-group NAME",
+DEFSH(VTYSH_NH_GROUP, vtysh_no_nexthop_group_cmd,
+      "no nexthop-group NHGNAME",
       NO_STR
       "Nexthop Group Configuration\n"
       "Name of the Nexthop Group\n")
@@ -2133,31 +2691,6 @@ DEFUNSH(VTYSH_VRF, vtysh_vrf, vtysh_vrf_cmd, "vrf NAME",
 {
 	vty->node = VRF_NODE;
 	return CMD_SUCCESS;
-}
-
-DEFSH(VTYSH_ZEBRA, vtysh_vrf_netns_cmd,
-      "netns NAME",
-      "Attach VRF to a Namespace\n"
-      "The file name in " NS_RUN_DIR ", or a full pathname\n")
-
-DEFSH(VTYSH_ZEBRA, vtysh_no_vrf_netns_cmd,
-      "no netns [NAME]",
-      NO_STR
-      "Detach VRF from a Namespace\n"
-      "The file name in " NS_RUN_DIR ", or a full pathname\n")
-
-DEFUNSH(VTYSH_NS, vtysh_exit_logicalrouter,
-	vtysh_exit_logicalrouter_cmd, "exit",
-	"Exit current mode and down to previous mode\n")
-{
-	return vtysh_exit(vty);
-}
-
-DEFUNSH(VTYSH_NS, vtysh_quit_logicalrouter,
-	vtysh_quit_logicalrouter_cmd, "quit",
-	"Exit current mode and down to previous mode\n")
-{
-	return vtysh_exit_logicalrouter(self, vty, argc, argv);
 }
 
 DEFUNSH(VTYSH_VRF, vtysh_exit_vrf, vtysh_exit_vrf_cmd, "exit",
@@ -2172,13 +2705,15 @@ DEFUNSH(VTYSH_VRF, vtysh_quit_vrf, vtysh_quit_vrf_cmd, "quit",
 	return vtysh_exit_vrf(self, vty, argc, argv);
 }
 
-DEFUNSH(VTYSH_PBRD | VTYSH_SHARPD, vtysh_exit_nexthop_group, vtysh_exit_nexthop_group_cmd,
+DEFUNSH(VTYSH_NH_GROUP,
+	vtysh_exit_nexthop_group, vtysh_exit_nexthop_group_cmd,
 	"exit", "Exit current mode and down to previous mode\n")
 {
 	return vtysh_exit(vty);
 }
 
-DEFUNSH(VTYSH_VRF, vtysh_quit_nexthop_group, vtysh_quit_nexthop_group_cmd,
+DEFUNSH(VTYSH_NH_GROUP,
+	vtysh_quit_nexthop_group, vtysh_quit_nexthop_group_cmd,
 	"quit", "Exit current mode and down to previous mode\n")
 {
 	return vtysh_exit_nexthop_group(self, vty, argc, argv);
@@ -2196,6 +2731,76 @@ DEFUNSH(VTYSH_INTERFACE, vtysh_quit_interface, vtysh_quit_interface_cmd, "quit",
 	return vtysh_exit_interface(self, vty, argc, argv);
 }
 
+DEFUNSH(VTYSH_ZEBRA, vtysh_exit_pseudowire, vtysh_exit_pseudowire_cmd, "exit",
+	"Exit current mode and down to previous mode\n")
+{
+	return vtysh_exit(vty);
+}
+
+DEFUNSH(VTYSH_ZEBRA, vtysh_quit_pseudowire, vtysh_quit_pseudowire_cmd, "quit",
+	"Exit current mode and down to previous mode\n")
+{
+	return vtysh_exit_pseudowire(self, vty, argc, argv);
+}
+
+static char *do_prepend(struct vty *vty, struct cmd_token **argv, int argc)
+{
+	const char *argstr[argc + 1];
+	int i, off = 0;
+
+	if (vty->node != VIEW_NODE) {
+		off = 1;
+		argstr[0] = "do";
+	}
+
+	for (i = 0; i < argc; i++)
+		argstr[i + off] = argv[i]->arg;
+
+	return frrstr_join(argstr, argc + off, " ");
+}
+
+static int show_per_daemon(struct vty *vty, struct cmd_token **argv, int argc,
+			   const char *headline)
+{
+	unsigned int i;
+	int ret = CMD_SUCCESS;
+	char *line = do_prepend(vty, argv, argc);
+
+	for (i = 0; i < array_size(vtysh_client); i++)
+		if (vtysh_client[i].fd >= 0 || vtysh_client[i].next) {
+			vty_out(vty, headline, vtysh_client[i].name);
+			ret = vtysh_client_execute(&vtysh_client[i], line);
+			vty_out(vty, "\n");
+		}
+
+	XFREE(MTYPE_TMP, line);
+
+	return ret;
+}
+
+static int show_one_daemon(struct vty *vty, struct cmd_token **argv, int argc,
+			   const char *name)
+{
+	int ret;
+	char *line = do_prepend(vty, argv, argc);
+
+	ret = vtysh_client_execute_name(name, line);
+
+	XFREE(MTYPE_TMP, line);
+
+	return ret;
+}
+
+DEFUN (vtysh_show_thread_timer,
+       vtysh_show_thread_timer_cmd,
+       "show thread timers",
+       SHOW_STR
+       "Thread information\n"
+       "Show all timers and how long they have in the system\n")
+{
+	return show_per_daemon(vty, argv, argc, "Thread timers for %s:\n");
+}
+
 DEFUN (vtysh_show_poll,
        vtysh_show_poll_cmd,
        "show thread poll",
@@ -2203,19 +2808,7 @@ DEFUN (vtysh_show_poll,
        "Thread information\n"
        "Thread Poll Information\n")
 {
-	unsigned int i;
-	int ret = CMD_SUCCESS;
-	char line[100];
-
-	snprintf(line, sizeof(line), "do show thread poll\n");
-	for (i = 0; i < array_size(vtysh_client); i++)
-		if (vtysh_client[i].fd >= 0) {
-			vty_out(vty, "Thread statistics for %s:\n",
-				vtysh_client[i].name);
-			ret = vtysh_client_execute(&vtysh_client[i], line);
-			vty_out(vty, "\n");
-		}
-	return ret;
+	return show_per_daemon(vty, argv, argc, "Thread statistics for %s:\n");
 }
 
 DEFUN (vtysh_show_thread,
@@ -2226,23 +2819,7 @@ DEFUN (vtysh_show_thread,
        "Thread CPU usage\n"
        "Display filter (rwtexb)\n")
 {
-	unsigned int i;
-	int idx = 0;
-	int ret = CMD_SUCCESS;
-	char line[100];
-
-	const char *filter =
-		argv_find(argv, argc, "FILTER", &idx) ? argv[idx]->arg : "";
-
-	snprintf(line, sizeof(line), "do show thread cpu %s\n", filter);
-	for (i = 0; i < array_size(vtysh_client); i++)
-		if (vtysh_client[i].fd >= 0) {
-			vty_out(vty, "Thread statistics for %s:\n",
-				vtysh_client[i].name);
-			ret = vtysh_client_execute(&vtysh_client[i], line);
-			vty_out(vty, "\n");
-		}
-	return ret;
+	return show_per_daemon(vty, argv, argc, "Thread statistics for %s:\n");
 }
 
 DEFUN (vtysh_show_work_queues,
@@ -2251,50 +2828,18 @@ DEFUN (vtysh_show_work_queues,
        SHOW_STR
        "Work Queue information\n")
 {
-	unsigned int i;
-	int ret = CMD_SUCCESS;
-	char line[] = "do show work-queues\n";
-
-	for (i = 0; i < array_size(vtysh_client); i++)
-		if (vtysh_client[i].fd >= 0) {
-			vty_out(vty, "Work queue statistics for %s:\n",
-				vtysh_client[i].name);
-			ret = vtysh_client_execute(&vtysh_client[i], line);
-			vty_out(vty, "\n");
-		}
-
-	return ret;
+	return show_per_daemon(vty, argv, argc,
+			       "Work queue statistics for %s:\n");
 }
 
 DEFUN (vtysh_show_work_queues_daemon,
        vtysh_show_work_queues_daemon_cmd,
-       "show work-queues <zebra|ripd|ripngd|ospfd|ospf6d|bgpd|isisd|pbrd|fabricd|pimd|staticd>",
+       "show work-queues " DAEMONS_LIST,
        SHOW_STR
        "Work Queue information\n"
-       "For the zebra daemon\n"
-       "For the rip daemon\n"
-       "For the ripng daemon\n"
-       "For the ospf daemon\n"
-       "For the ospfv6 daemon\n"
-       "For the bgp daemon\n"
-       "For the isis daemon\n"
-       "For the pbr daemon\n"
-       "For the fabricd daemon\n"
-       "For the pim daemon\n"
-       "For the static daemon\n")
+       DAEMONS_STR)
 {
-	int idx_protocol = 2;
-	unsigned int i;
-	int ret = CMD_SUCCESS;
-
-	for (i = 0; i < array_size(vtysh_client); i++) {
-		if (strmatch(vtysh_client[i].name, argv[idx_protocol]->text))
-			break;
-	}
-
-	ret = vtysh_client_execute(&vtysh_client[i], "show work-queues\n");
-
-	return ret;
+	return show_one_daemon(vty, argv, argc - 1, argv[argc - 1]->text);
 }
 
 DEFUNSH(VTYSH_ZEBRA, vtysh_link_params, vtysh_link_params_cmd, "link-params",
@@ -2312,19 +2857,18 @@ DEFUNSH(VTYSH_ZEBRA, exit_link_params, exit_link_params_cmd, "exit-link-params",
 	return CMD_SUCCESS;
 }
 
-static int show_per_daemon(const char *line, const char *headline)
+DEFUNSH(VTYSH_ZEBRA, vtysh_exit_link_params, vtysh_exit_link_params_cmd, "exit",
+	"Exit current mode and down to previous mode\n")
 {
-	unsigned int i;
-	int ret = CMD_SUCCESS;
+	if (vty->node == LINK_PARAMS_NODE)
+		vty->node = INTERFACE_NODE;
+	return CMD_SUCCESS;
+}
 
-	for (i = 0; i < array_size(vtysh_client); i++)
-		if (vtysh_client[i].fd >= 0) {
-			vty_out(vty, headline, vtysh_client[i].name);
-			ret = vtysh_client_execute(&vtysh_client[i], line);
-			vty_out(vty, "\n");
-		}
-
-	return ret;
+DEFUNSH(VTYSH_ZEBRA, vtysh_quit_link_params, vtysh_quit_link_params_cmd, "quit",
+	"Exit current mode and down to previous mode\n")
+{
+	return vtysh_exit_link_params(self, vty, argc, argv);
 }
 
 DEFUNSH_HIDDEN (0x00,
@@ -2344,7 +2888,7 @@ DEFUN (vtysh_show_debugging,
        SHOW_STR
        DEBUG_STR)
 {
-	return show_per_daemon("do show debugging\n", "");
+	return show_per_daemon(vty, argv, argc, "");
 }
 
 DEFUN (vtysh_show_debugging_hashtable,
@@ -2355,6 +2899,8 @@ DEFUN (vtysh_show_debugging_hashtable,
        "Statistics about hash tables\n"
        "Statistics about hash tables\n")
 {
+	bool stats = strmatch(argv[argc - 1]->text, "statistics");
+
 	vty_out(vty, "\n");
 	vty_out(vty,
 		"Load factor (LF) - average number of elements across all buckets\n");
@@ -2366,7 +2912,7 @@ DEFUN (vtysh_show_debugging_hashtable,
 		"and indicates the typical deviation of bucket chain length\n");
 	vty_out(vty, "from the value in the corresponding load factor.\n\n");
 
-	return show_per_daemon("do show debugging hashtable\n",
+	return show_per_daemon(vty, argv, stats ? argc - 1 : argc,
 			       "Hashtable statistics for %s:\n");
 }
 
@@ -2379,27 +2925,152 @@ DEFUN (vtysh_show_error_code,
        "Information on all errors\n"
        JSON_STR)
 {
-	char *fcmd = argv_concat(argv, argc, 0);
-	char cmd[256];
-	int rv;
+	uint32_t arg = 0;
 
-	snprintf(cmd, sizeof(cmd), "do %s", fcmd);
+	if (!strmatch(argv[2]->text, "all"))
+		arg = strtoul(argv[2]->arg, NULL, 10);
 
-	/* FIXME: Needs to determine which daemon to send to via code ranges */
-	rv = show_per_daemon(cmd, "");
+	/* If it's not a shared code, send it to all the daemons */
+	if (arg < LIB_FERR_START || arg > LIB_FERR_END) {
+		show_per_daemon(vty, argv, argc, "");
+		/* Otherwise, print it ourselves to avoid duplication */
+	} else {
+		bool json = strmatch(argv[argc - 1]->text, "json");
 
-	XFREE(MTYPE_TMP, fcmd);
-	return rv;
+		if (!strmatch(argv[2]->text, "all"))
+			arg = strtoul(argv[2]->arg, NULL, 10);
+
+		log_ref_display(vty, arg, json);
+	}
+
+	return CMD_SUCCESS;
+}
+
+/* Northbound. */
+DEFUN_HIDDEN (show_config_running,
+       show_config_running_cmd,
+       "show configuration running\
+          [<json|xml> [translate WORD]]\
+          [with-defaults]" DAEMONS_LIST,
+       SHOW_STR
+       "Configuration information\n"
+       "Running configuration\n"
+       "Change output format to JSON\n"
+       "Change output format to XML\n"
+       "Translate output\n"
+       "YANG module translator\n"
+       "Show default values\n"
+       DAEMONS_STR)
+{
+	return show_one_daemon(vty, argv, argc - 1, argv[argc - 1]->text);
+}
+
+DEFUN (show_yang_operational_data,
+       show_yang_operational_data_cmd,
+       "show yang operational-data XPATH\
+         [{\
+	   format <json|xml>\
+	   |translate WORD\
+	   |with-config\
+	 }]" DAEMONS_LIST,
+       SHOW_STR
+       "YANG information\n"
+       "Show YANG operational data\n"
+       "XPath expression specifying the YANG data path\n"
+       "Set the output format\n"
+       "JavaScript Object Notation\n"
+       "Extensible Markup Language\n"
+       "Translate operational data\n"
+       "YANG module translator\n"
+       "Merge configuration data\n"
+       DAEMONS_STR)
+{
+	return show_one_daemon(vty, argv, argc - 1, argv[argc - 1]->text);
+}
+
+DEFUN(show_yang_module, show_yang_module_cmd,
+      "show yang module [module-translator WORD] " DAEMONS_LIST,
+      SHOW_STR
+      "YANG information\n"
+      "Show loaded modules\n"
+      "YANG module translator\n"
+      "YANG module translator\n" DAEMONS_STR)
+{
+	return show_one_daemon(vty, argv, argc - 1, argv[argc - 1]->text);
+}
+
+DEFUN(show_yang_module_detail, show_yang_module_detail_cmd,
+      "show yang module\
+          [module-translator WORD]\
+          WORD <compiled|summary|tree|yang|yin> " DAEMONS_LIST,
+      SHOW_STR
+      "YANG information\n"
+      "Show loaded modules\n"
+      "YANG module translator\n"
+      "YANG module translator\n"
+      "Module name\n"
+      "Display compiled module in YANG format\n"
+      "Display summary information about the module\n"
+      "Display module in the tree (RFC 8340) format\n"
+      "Display module in the YANG format\n"
+      "Display module in the YIN format\n" DAEMONS_STR)
+{
+	return show_one_daemon(vty, argv, argc - 1, argv[argc - 1]->text);
+}
+
+
+DEFUNSH(VTYSH_ALL, debug_nb,
+	debug_nb_cmd,
+	"[no] debug northbound\
+	   [<\
+	    callbacks [{configuration|state|rpc}]\
+	    |notifications\
+	    |events\
+	    |libyang\
+	   >]",
+	NO_STR
+	DEBUG_STR
+	"Northbound debugging\n"
+	"Callbacks\n"
+	"Configuration\n"
+	"State\n"
+	"RPC\n"
+	"Notifications\n"
+	"Events\n"
+	"libyang debugging\n")
+{
+	return CMD_SUCCESS;
+}
+
+DEFUN (vtysh_show_history,
+       vtysh_show_history_cmd,
+       "show history",
+       SHOW_STR
+       "The list of commands stored in history\n")
+{
+	HIST_ENTRY **hlist = history_list();
+	int i = 0;
+
+	while (hlist[i]) {
+		vty_out(vty, "%s\n", hlist[i]->line);
+		i++;
+	}
+	return CMD_SUCCESS;
 }
 
 /* Memory */
 DEFUN (vtysh_show_memory,
        vtysh_show_memory_cmd,
-       "show memory",
+       "show memory [" DAEMONS_LIST "]",
        SHOW_STR
-       "Memory statistics\n")
+       "Memory statistics\n"
+       DAEMONS_STR)
 {
-	return show_per_daemon("do show memory\n", "Memory statistics for %s:\n");
+	if (argc == 3)
+		return show_one_daemon(vty, argv, argc - 1,
+				       argv[argc - 1]->text);
+
+	return show_per_daemon(vty, argv, argc, "Memory statistics for %s:\n");
 }
 
 DEFUN (vtysh_show_modules,
@@ -2408,8 +3079,7 @@ DEFUN (vtysh_show_modules,
        SHOW_STR
        "Loaded modules\n")
 {
-	return show_per_daemon("do show modules\n",
-			       "Module information for %s:\n");
+	return show_per_daemon(vty, argv, argc, "Module information for %s:\n");
 }
 
 /* Logging commands. */
@@ -2419,145 +3089,83 @@ DEFUN (vtysh_show_logging,
        SHOW_STR
        "Show current logging configuration\n")
 {
-	return show_per_daemon("do show logging\n",
+	return show_per_daemon(vty, argv, argc,
 			       "Logging configuration for %s:\n");
 }
 
-DEFUNSH(VTYSH_ALL, vtysh_log_stdout, vtysh_log_stdout_cmd, "log stdout",
-	"Logging control\n"
-	"Set stdout logging level\n")
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, vtysh_log_stdout_level, vtysh_log_stdout_level_cmd,
-	"log stdout <emergencies|alerts|critical|errors|warnings|notifications|informational|debugging>",
-	"Logging control\n"
-	"Set stdout logging level\n" LOG_LEVEL_DESC)
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, no_vtysh_log_stdout, no_vtysh_log_stdout_cmd,
-	"no log stdout [LEVEL]", NO_STR
-	"Logging control\n"
-	"Cancel logging to stdout\n"
-	"Logging level\n")
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, vtysh_log_file, vtysh_log_file_cmd, "log file FILENAME",
-	"Logging control\n"
-	"Logging to file\n"
-	"Logging filename\n")
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, vtysh_log_file_level, vtysh_log_file_level_cmd,
-	"log file FILENAME <emergencies|alerts|critical|errors|warnings|notifications|informational|debugging>",
-	"Logging control\n"
-	"Logging to file\n"
-	"Logging filename\n" LOG_LEVEL_DESC)
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, no_vtysh_log_file, no_vtysh_log_file_cmd,
-	"no log file [FILENAME [LEVEL]]", NO_STR
-	"Logging control\n"
-	"Cancel logging to file\n"
-	"Logging file name\n"
-	"Logging level\n")
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, vtysh_log_monitor, vtysh_log_monitor_cmd,
-	"log monitor [<emergencies|alerts|critical|errors|warnings|notifications|informational|debugging>]",
-	"Logging control\n"
-	"Set terminal line (monitor) logging level\n" LOG_LEVEL_DESC)
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, no_vtysh_log_monitor, no_vtysh_log_monitor_cmd,
-	"no log monitor [LEVEL]", NO_STR
-	"Logging control\n"
-	"Disable terminal line (monitor) logging\n"
-	"Logging level\n")
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, vtysh_log_syslog, vtysh_log_syslog_cmd,
-	"log syslog [<emergencies|alerts|critical|errors|warnings|notifications|informational|debugging>]",
-	"Logging control\n"
-	"Set syslog logging level\n" LOG_LEVEL_DESC)
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, no_vtysh_log_syslog, no_vtysh_log_syslog_cmd,
-	"no log syslog [<emergencies|alerts|critical|errors|warnings|notifications|informational|debugging>]",
+DEFUNSH(VTYSH_ALL, vtysh_debug_memstats,
+	vtysh_debug_memstats_cmd, "[no] debug memstats-at-exit",
 	NO_STR
-	"Logging control\n"
-	"Cancel logging to syslog\n"
-	LOG_LEVEL_DESC)
+	"Debug\n"
+	"Print memory statistics at exit\n")
 {
 	return CMD_SUCCESS;
 }
 
-DEFUNSH(VTYSH_ALL, vtysh_log_facility, vtysh_log_facility_cmd,
-	"log facility <kern|user|mail|daemon|auth|syslog|lpr|news|uucp|cron|local0|local1|local2|local3|local4|local5|local6|local7>",
-	"Logging control\n"
-	"Facility parameter for syslog messages\n" LOG_FACILITY_DESC)
+DEFUN(vtysh_debug_uid_backtrace,
+      vtysh_debug_uid_backtrace_cmd,
+      "[no] debug unique-id UID backtrace",
+      NO_STR
+      DEBUG_STR
+      "Options per individual log message, by unique ID\n"
+      "Log message unique ID (XXXXX-XXXXX)\n"
+      "Add backtrace to log when message is printed\n")
+{
+	unsigned int i, ok = 0;
+	int err = CMD_SUCCESS, ret;
+	const char *uid;
+	char line[64];
+
+	if (!strcmp(argv[0]->text, "no")) {
+		uid = argv[3]->arg;
+		snprintfrr(line, sizeof(line),
+			   "no debug unique-id %s backtrace", uid);
+	} else {
+		uid = argv[2]->arg;
+		snprintfrr(line, sizeof(line), "debug unique-id %s backtrace",
+			   uid);
+	}
+
+	for (i = 0; i < array_size(vtysh_client); i++)
+		if (vtysh_client[i].fd >= 0 || vtysh_client[i].next) {
+			ret = vtysh_client_execute(&vtysh_client[i], line);
+			switch (ret) {
+			case CMD_SUCCESS:
+				ok++;
+				break;
+			case CMD_ERR_NOTHING_TODO:
+				/* ignore this daemon
+				 *
+				 * note this doesn't need to handle instances
+				 * of the same daemon individually because
+				 * the same daemon will have the same UIDs
+				 */
+				break;
+			default:
+				if (err == CMD_SUCCESS)
+					err = ret;
+				break;
+			}
+		}
+
+	if (err == CMD_SUCCESS && !ok) {
+		vty_out(vty, "%% no running daemon recognizes unique-ID %s\n",
+			uid);
+		err = CMD_WARNING;
+	}
+	return err;
+}
+
+DEFUNSH(VTYSH_ALL, vtysh_allow_reserved_ranges, vtysh_allow_reserved_ranges_cmd,
+	"allow-reserved-ranges",
+	"Allow using IPv4 (Class E) reserved IP space\n")
 {
 	return CMD_SUCCESS;
 }
 
-DEFUNSH(VTYSH_ALL, no_vtysh_log_facility, no_vtysh_log_facility_cmd,
-	"no log facility [FACILITY]", NO_STR
-	"Logging control\n"
-	"Reset syslog facility to default (daemon)\n"
-	"Syslog facility\n")
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, vtysh_log_record_priority, vtysh_log_record_priority_cmd,
-	"log record-priority",
-	"Logging control\n"
-	"Log the priority of the message within the message\n")
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, no_vtysh_log_record_priority,
-	no_vtysh_log_record_priority_cmd, "no log record-priority", NO_STR
-	"Logging control\n"
-	"Do not log the priority of the message within the message\n")
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, vtysh_log_timestamp_precision,
-	vtysh_log_timestamp_precision_cmd, "log timestamp precision (0-6)",
-	"Logging control\n"
-	"Timestamp configuration\n"
-	"Set the timestamp precision\n"
-	"Number of subsecond digits\n")
-{
-	return CMD_SUCCESS;
-}
-
-DEFUNSH(VTYSH_ALL, no_vtysh_log_timestamp_precision,
-	no_vtysh_log_timestamp_precision_cmd, "no log timestamp precision",
-	NO_STR
-	"Logging control\n"
-	"Timestamp configuration\n"
-	"Reset the timestamp precision to the default value of 0\n")
+DEFUNSH(VTYSH_ALL, no_vtysh_allow_reserved_ranges,
+	no_vtysh_allow_reserved_ranges_cmd, "no allow-reserved-ranges",
+	NO_STR "Allow using IPv4 (Class E) reserved IP space\n")
 {
 	return CMD_SUCCESS;
 }
@@ -2619,27 +3227,22 @@ DEFUNSH(VTYSH_ALL, no_vtysh_config_enable_password,
 
 DEFUN (vtysh_write_terminal,
        vtysh_write_terminal_cmd,
-       "write terminal [<zebra|ripd|ripngd|ospfd|ospf6d|ldpd|bgpd|isisd|fabricd|pimd|staticd>]",
+       "write terminal ["DAEMONS_LIST"] [no-header]",
        "Write running configuration to memory, network, or terminal\n"
        "Write to terminal\n"
-       "For the zebra daemon\n"
-       "For the rip daemon\n"
-       "For the ripng daemon\n"
-       "For the ospf daemon\n"
-       "For the ospfv6 daemon\n"
-       "For the ldpd daemon\n"
-       "For the bgp daemon\n"
-       "For the isis daemon\n"
-       "For the fabricd daemon\n"
-       "For the pim daemon\n"
-       "For the static daemon\n")
+       DAEMONS_STR
+       "Skip \"Building configuration...\" header\n")
 {
 	unsigned int i;
-	char line[] = "do write terminal\n";
+	char line[] = "do write terminal";
 
-	vty_out(vty, "Building configuration...\n");
-	vty_out(vty, "\nCurrent configuration:\n");
-	vty_out(vty, "!\n");
+	if (!strcmp(argv[argc - 1]->arg, "no-header"))
+		argc--;
+	else {
+		vty_out(vty, "Building configuration...\n");
+		vty_out(vty, "\nCurrent configuration:\n");
+		vty_out(vty, "!\n");
+	}
 
 	for (i = 0; i < array_size(vtysh_client); i++)
 		if ((argc < 3)
@@ -2658,20 +3261,11 @@ DEFUN (vtysh_write_terminal,
 
 DEFUN (vtysh_show_running_config,
        vtysh_show_running_config_cmd,
-       "show running-config [<zebra|ripd|ripngd|ospfd|ospf6d|ldpd|bgpd|isisd|fabricd|pimd|staticd>]",
+       "show running-config ["DAEMONS_LIST"] [no-header]",
        SHOW_STR
        "Current operating configuration\n"
-       "For the zebra daemon\n"
-       "For the rip daemon\n"
-       "For the ripng daemon\n"
-       "For the ospf daemon\n"
-       "For the ospfv6 daemon\n"
-       "For the ldp daemon\n"
-       "For the bgp daemon\n"
-       "For the isis daemon\n"
-       "For the fabricd daemon\n"
-       "For the pim daemon\n"
-       "For the static daemon\n")
+       DAEMONS_STR
+       "Skip \"Building configuration...\" header\n")
 {
 	return vtysh_write_terminal(self, vty, argc, argv);
 }
@@ -2701,25 +3295,25 @@ static void backup_config_file(const char *fbackup)
 {
 	char *integrate_sav = NULL;
 
-	integrate_sav = malloc(strlen(fbackup) + strlen(CONF_BACKUP_EXT) + 1);
-	strcpy(integrate_sav, fbackup);
-	strcat(integrate_sav, CONF_BACKUP_EXT);
+	size_t integrate_sav_sz = strlen(fbackup) + strlen(CONF_BACKUP_EXT) + 1;
+	integrate_sav = malloc(integrate_sav_sz);
+	strlcpy(integrate_sav, fbackup, integrate_sav_sz);
+	strlcat(integrate_sav, CONF_BACKUP_EXT, integrate_sav_sz);
 
 	/* Move current configuration file to backup config file. */
-	if (unlink(integrate_sav) != 0) {
-		vty_out(vty, "Warning: %s unlink failed\n", integrate_sav);
-	}
-	if (rename(fbackup, integrate_sav) != 0) {
-		vty_out(vty, "Error renaming %s to %s\n", fbackup,
-			integrate_sav);
-	}
+	if (unlink(integrate_sav) != 0 && errno != ENOENT)
+		vty_out(vty, "Unlink failed for %s: %s\n", integrate_sav,
+			strerror(errno));
+	if (rename(fbackup, integrate_sav) != 0 && errno != ENOENT)
+		vty_out(vty, "Error renaming %s to %s: %s\n", fbackup,
+			integrate_sav, strerror(errno));
 	free(integrate_sav);
 }
 
 int vtysh_write_config_integrated(void)
 {
 	unsigned int i;
-	char line[] = "do write terminal\n";
+	char line[] = "do write terminal";
 	FILE *fp;
 	int fd;
 #ifdef FRR_USER
@@ -2797,6 +3391,18 @@ int vtysh_write_config_integrated(void)
 		err++;
 	}
 
+	if (fflush(fp) != 0) {
+		printf("%% Warning: fflush() failed on %s: %s\n", frr_config,
+		       safe_strerror(errno));
+		err++;
+	}
+
+	if (fsync(fd) < 0) {
+		printf("%% Warning: fsync() failed on %s: %s\n", frr_config,
+		       safe_strerror(errno));
+		err++;
+	}
+
 	fclose(fp);
 
 	printf("Integrated configuration saved to %s\n", frr_config);
@@ -2832,12 +3438,12 @@ DEFUN (vtysh_write_memory,
        "Write configuration to the file (same as write memory)\n")
 {
 	int ret = CMD_SUCCESS;
-	char line[] = "do write memory\n";
+	char line[] = "do write memory";
 	unsigned int i;
 
 	vty_out(vty, "Note: this version of vtysh never writes vtysh.conf\n");
 
-	/* If integrated frr.conf explicitely set. */
+	/* If integrated frr.conf explicitly set. */
 	if (want_config_integrated()) {
 		ret = CMD_WARNING_CONFIG_FAILED;
 
@@ -2858,9 +3464,7 @@ DEFUN (vtysh_write_memory,
 		 * ourselves
 		 */
 		if (!used_watchfrr) {
-			printf("\nWarning: attempting direct configuration write without "
-			       "watchfrr.\nFile permissions and ownership may be "
-			       "incorrect, or write may fail.\n\n");
+			printf("\nWarning: attempting direct configuration write without watchfrr.\nFile permissions and ownership may be incorrect, or write may fail.\n\n");
 			ret = vtysh_write_config_integrated();
 		}
 		return ret;
@@ -2882,6 +3486,24 @@ DEFUN (vtysh_copy_running_config,
        "Copy to startup configuration\n")
 {
 	return vtysh_write_memory(self, vty, argc, argv);
+}
+
+DEFUN (vtysh_copy_to_running,
+       vtysh_copy_to_running_cmd,
+       "copy FILENAME running-config",
+       "Apply a configuration file\n"
+       "Configuration file to read\n"
+       "Apply to current configuration\n")
+{
+	int ret;
+	const char *fname = argv[1]->arg;
+
+	ret = vtysh_read_config(fname, true);
+
+	/* Return to enable mode - the 'read_config' api leaves us up a level */
+	vtysh_execute_no_pager("enable");
+
+	return ret;
 }
 
 DEFUN (vtysh_terminal_paginate,
@@ -2952,6 +3574,292 @@ DEFUN (vtysh_show_daemons,
 
 	return CMD_SUCCESS;
 }
+
+struct visual_prio {
+	/* 4 characters for nice alignment */
+	const char *label;
+
+	int c256_background;
+	int c256_formatarg;
+};
+
+/* clang-format off */
+struct visual_prio visual_prios[] = {
+	[LOG_EMERG] = {
+		.label = "\e[31;1mEMRG",
+		.c256_background = 53,
+		.c256_formatarg = 225,
+	},
+	[LOG_ALERT] = {
+		.label = "\e[31;1mALRT",
+		.c256_background = 53,
+		.c256_formatarg = 225,
+	},
+	[LOG_CRIT] = {
+		.label = "\e[31;1mCRIT",
+		.c256_background = 53,
+		.c256_formatarg = 225,
+	},
+	[LOG_ERR] = {
+		.label = "\e[38;5;202mERR!",
+		.c256_background = 52,
+		.c256_formatarg = 224,
+	},
+	[LOG_WARNING] = {
+		.label = "\e[38;5;222mWARN",
+		.c256_background = 58,
+		.c256_formatarg = 230,
+	},
+	[LOG_NOTICE] = {
+		.label = "NTFY",
+		.c256_background = 234,
+		.c256_formatarg = 195,
+	},
+	[LOG_INFO] = {
+		.label = "\e[38;5;192mINFO",
+		.c256_background = 236,
+		.c256_formatarg = 195,
+	},
+	[LOG_DEBUG] = {
+		.label = "\e[38;5;116mDEBG",
+		.c256_background = 238,
+		.c256_formatarg = 195,
+	},
+};
+/* clang-format on */
+
+static void vtysh_log_print(struct vtysh_client *vclient,
+			    struct zlog_live_hdr *hdr, const char *text)
+{
+	size_t textlen = hdr->textlen, textpos = 0;
+	time_t ts = hdr->ts_sec;
+	struct visual_prio *vis;
+	struct tm tm;
+	char ts_buf[32];
+
+	if (hdr->prio >= array_size(visual_prios))
+		vis = &visual_prios[LOG_CRIT];
+	else
+		vis = &visual_prios[hdr->prio];
+
+	localtime_r(&ts, &tm);
+	strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S", &tm);
+
+	if (!stderr_tty) {
+		const char *label = vis->label + strlen(vis->label) - 4;
+
+		fprintf(stderr, "%s.%03u [%s] %s: %.*s\n", ts_buf,
+			hdr->ts_nsec / 1000000U, label, vclient->name,
+			(int)textlen, text);
+		return;
+	}
+
+	fprintf(stderr,
+		"\e[48;5;%dm\e[38;5;247m%s.%03u [%s\e[38;5;247m] \e[38;5;255m%s\e[38;5;247m: \e[38;5;251m",
+		vis->c256_background, ts_buf, hdr->ts_nsec / 1000000U,
+		vis->label, vclient->name);
+
+	for (size_t fmtpos = 0; fmtpos < hdr->n_argpos; fmtpos++) {
+		struct fmt_outpos *fmt = &hdr->argpos[fmtpos];
+
+		if (fmt->off_start < textpos || fmt->off_end < fmt->off_start ||
+		    fmt->off_end > textlen)
+			continue;
+
+		while (fmt->off_end > fmt->off_start &&
+		       text[fmt->off_end - 1] == ' ')
+			fmt->off_end--;
+
+		fprintf(stderr, "%.*s\e[38;5;%dm%.*s\e[38;5;251m",
+			(int)(fmt->off_start - textpos), text + textpos,
+			vis->c256_formatarg,
+			(int)(fmt->off_end - fmt->off_start),
+			text + fmt->off_start);
+		textpos = fmt->off_end;
+	}
+	fprintf(stderr, "%.*s\033[K\033[m\n", (int)(textlen - textpos),
+		text + textpos);
+}
+
+static void vtysh_log_read(struct thread *thread)
+{
+	struct vtysh_client *vclient = THREAD_ARG(thread);
+	struct {
+		struct zlog_live_hdr hdr;
+		char text[4096];
+	} buf;
+	const char *text;
+	ssize_t ret;
+
+	thread_add_read(master, vtysh_log_read, vclient, vclient->log_fd,
+			&vclient->log_reader);
+
+	ret = recv(vclient->log_fd, &buf, sizeof(buf), 0);
+
+	if (ret < 0 && ERRNO_IO_RETRY(errno))
+		return;
+
+	if (stderr_stdout_same) {
+#ifdef HAVE_RL_CLEAR_VISIBLE_LINE
+		rl_clear_visible_line();
+#else
+		puts("\r");
+#endif
+		fflush(stdout);
+	}
+
+	if (ret <= 0) {
+		struct timespec ts;
+
+		buf.text[0] = '\0'; /* coverity */
+
+		if (ret != 0)
+			snprintfrr(buf.text, sizeof(buf.text),
+				   "log monitor connection error: %m");
+		else
+			snprintfrr(
+				buf.text, sizeof(buf.text),
+				"log monitor connection closed unexpectedly");
+		buf.hdr.textlen = strlen(buf.text);
+
+		THREAD_OFF(vclient->log_reader);
+		close(vclient->log_fd);
+		vclient->log_fd = -1;
+
+		clock_gettime(CLOCK_REALTIME, &ts);
+		buf.hdr.ts_sec = ts.tv_sec;
+		buf.hdr.ts_nsec = ts.tv_nsec;
+		buf.hdr.prio = LOG_ERR;
+		buf.hdr.flags = 0;
+		buf.hdr.texthdrlen = 0;
+		buf.hdr.n_argpos = 0;
+	} else {
+		int32_t lost_msgs = buf.hdr.lost_msgs - vclient->lost_msgs;
+
+		if (lost_msgs > 0) {
+			vclient->lost_msgs = buf.hdr.lost_msgs;
+			fprintf(stderr,
+				"%d log messages from %s lost (vtysh reading too slowly)\n",
+				lost_msgs, vclient->name);
+		}
+	}
+
+	text = buf.text + sizeof(buf.hdr.argpos[0]) * buf.hdr.n_argpos;
+	vtysh_log_print(vclient, &buf.hdr, text);
+
+	if (stderr_stdout_same)
+		rl_forced_update_display();
+
+	return;
+}
+
+#ifdef CLIPPY
+/* clippy/clidef can't process the DEFPY below without some value for this */
+#define DAEMONS_LIST "daemon"
+#endif
+
+DEFPY (vtysh_terminal_monitor,
+       vtysh_terminal_monitor_cmd,
+       "terminal monitor ["DAEMONS_LIST"]$daemon",
+       "Set terminal line parameters\n"
+       "Receive log messages to active VTY session\n"
+       DAEMONS_STR)
+{
+	static const char line[] = "terminal monitor";
+	int ret_all = CMD_SUCCESS, ret, fd;
+	size_t i, ok = 0;
+
+	for (i = 0; i < array_size(vtysh_client); i++) {
+		struct vtysh_client *vclient = &vtysh_client[i];
+
+		if (daemon && strcmp(vclient->name, daemon))
+			continue;
+
+		for (; vclient; vclient = vclient->next) {
+			if (vclient->log_fd != -1) {
+				vty_out(vty, "%% %s: already monitoring logs\n",
+					vclient->name);
+				ok++;
+				continue;
+			}
+
+			fd = -1;
+			ret = vtysh_client_run(vclient, line, NULL, NULL, &fd);
+			if (fd != -1) {
+				set_nonblocking(fd);
+				vclient->log_fd = fd;
+				thread_add_read(master, vtysh_log_read, vclient,
+						vclient->log_fd,
+						&vclient->log_reader);
+			}
+			if (ret != CMD_SUCCESS) {
+				vty_out(vty, "%% failed to enable logs on %s\n",
+					vclient->name);
+				ret_all = CMD_WARNING;
+			} else
+				ok++;
+		}
+	}
+
+	if (!ok && ret_all == CMD_SUCCESS) {
+		vty_out(vty,
+			"%% command had no effect, relevant daemons not connected?\n");
+		ret_all = CMD_WARNING;
+	}
+	return ret_all;
+}
+
+DEFPY (no_vtysh_terminal_monitor,
+       no_vtysh_terminal_monitor_cmd,
+       "no terminal monitor ["DAEMONS_LIST"]$daemon",
+       NO_STR
+       "Set terminal line parameters\n"
+       "Receive log messages to active VTY session\n"
+       DAEMONS_STR)
+{
+	static const char line[] = "no terminal monitor";
+	int ret_all = CMD_SUCCESS, ret;
+	size_t i, ok = 0;
+
+	for (i = 0; i < array_size(vtysh_client); i++) {
+		struct vtysh_client *vclient = &vtysh_client[i];
+
+		if (daemon && strcmp(vclient->name, daemon))
+			continue;
+
+		for (; vclient; vclient = vclient->next) {
+			/* run this even if log_fd == -1, in case something
+			 * got desync'd
+			 */
+			ret = vtysh_client_run(vclient, line, NULL, NULL, NULL);
+			if (ret != CMD_SUCCESS) {
+				vty_out(vty,
+					"%% failed to disable logs on %s\n",
+					vclient->name);
+				ret_all = CMD_WARNING;
+			} else
+				ok++;
+
+			/* with this being a datagram socket, we can't expect
+			 * a close notification...
+			 */
+			if (vclient->log_fd != -1) {
+				THREAD_OFF(vclient->log_reader);
+
+				close(vclient->log_fd);
+				vclient->log_fd = -1;
+			}
+		}
+	}
+
+	if (!ok && ret_all == CMD_SUCCESS) {
+		vty_out(vty,
+			"%% command had no effect, relevant daemons not connected?\n");
+		ret_all = CMD_WARNING;
+	}
+	return ret_all;
+}
+
 
 /* Execute command in child process. */
 static void execute_command(const char *command, int argc, const char *arg1,
@@ -3171,31 +4079,11 @@ DEFUN (no_vtysh_output_file,
 
 DEFUN(find,
       find_cmd,
-      "find COMMAND...",
-      "Find CLI command containing text\n"
-      "Text to search for\n")
+      "find REGEX...",
+      "Find CLI command matching a regular expression\n"
+      "Search pattern (POSIX regex)\n")
 {
-	char *text = argv_concat(argv, argc, 1);
-	const struct cmd_node *node;
-	const struct cmd_element *cli;
-	vector clis;
-
-	for (unsigned int i = 0; i < vector_active(cmdvec); i++) {
-		node = vector_slot(cmdvec, i);
-		if (!node)
-			continue;
-		clis = node->cmd_vector;
-		for (unsigned int j = 0; j < vector_active(clis); j++) {
-			cli = vector_slot(clis, j);
-			if (strcasestr(cli->string, text))
-				vty_out(vty, "  (%s)  %s\n",
-					node_names[node->node], cli->string);
-		}
-	}
-
-	XFREE(MTYPE_TMP, text);
-
-	return CMD_SUCCESS;
+	return cmd_find_cmds(vty, argv, argc);
 }
 
 DEFUN_HIDDEN(show_cli_graph_vtysh,
@@ -3215,11 +4103,11 @@ DEFUN_HIDDEN(show_cli_graph_vtysh,
 
 static void vtysh_install_default(enum node_type node)
 {
-	install_element(node, &config_list_cmd);
-	install_element(node, &find_cmd);
-	install_element(node, &show_cli_graph_vtysh_cmd);
-	install_element(node, &vtysh_output_file_cmd);
-	install_element(node, &no_vtysh_output_file_cmd);
+	_install_element(node, &config_list_cmd);
+	_install_element(node, &find_cmd);
+	_install_element(node, &show_cli_graph_vtysh_cmd);
+	_install_element(node, &vtysh_output_file_cmd);
+	_install_element(node, &no_vtysh_output_file_cmd);
 }
 
 /* Making connection to protocol daemon. */
@@ -3261,7 +4149,7 @@ static int vtysh_connect(struct vtysh_client *vclient)
 		return -1;
 	}
 
-	memset(&addr, 0, sizeof(struct sockaddr_un));
+	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
 	strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
 #ifdef HAVE_STRUCT_SOCKADDR_UN_SUN_LEN
@@ -3346,7 +4234,7 @@ static void vtysh_update_all_instances(struct vtysh_client *head_client)
 	dir = opendir(vtydir);
 	if (dir) {
 		while ((file = readdir(dir)) != NULL) {
-			if (begins_with(file->d_name, "ospfd-")
+			if (frrstr_startswith(file->d_name, "ospfd-")
 			    && ends_with(file->d_name, ".vty")) {
 				if (n == MAXIMUM_INSTANCES) {
 					fprintf(stderr,
@@ -3419,17 +4307,23 @@ static char *vtysh_completion_entry_function(const char *ignore,
 void vtysh_readline_init(void)
 {
 	/* readline related settings. */
+	char *disable_bracketed_paste =
+		XSTRDUP(MTYPE_TMP, "set enable-bracketed-paste off");
+
 	rl_initialize();
+	rl_parse_and_bind(disable_bracketed_paste);
 	rl_bind_key('?', (rl_command_func_t *)vtysh_rl_describe);
 	rl_completion_entry_function = vtysh_completion_entry_function;
 	rl_attempted_completion_function = new_completion;
+
+	XFREE(MTYPE_TMP, disable_bracketed_paste);
 }
 
 char *vtysh_prompt(void)
 {
-	static char buf[100];
+	static char buf[512];
 
-	snprintf(buf, sizeof buf, cmd_prompt(vty->node), cmd_hostname_get());
+	snprintf(buf, sizeof(buf), cmd_prompt(vty->node), cmd_hostname_get());
 	return buf;
 }
 
@@ -3474,6 +4368,21 @@ void vtysh_uninit(void)
 
 void vtysh_init_vty(void)
 {
+	struct stat st_out, st_err;
+
+	cmd_defer_tree(true);
+
+	for (size_t i = 0; i < array_size(vtysh_client); i++) {
+		vtysh_client[i].fd = -1;
+		vtysh_client[i].log_fd = -1;
+	}
+
+	stderr_tty = isatty(STDERR_FILENO);
+
+	if (fstat(STDOUT_FILENO, &st_out) || fstat(STDERR_FILENO, &st_err) ||
+	    (st_out.st_dev == st_err.st_dev && st_out.st_ino == st_err.st_ino))
+		stderr_stdout_same = true;
+
 	/* Make vty structure. */
 	vty = vty_new();
 	vty->type = VTY_SHELL;
@@ -3487,56 +4396,425 @@ void vtysh_init_vty(void)
 	cmd_init(0);
 	cmd_variable_handler_register(vtysh_var_handler);
 
-	/* Install nodes. */
-	install_node(&bgp_node, NULL);
-	install_node(&rip_node, NULL);
-	install_node(&interface_node, NULL);
-	install_node(&pw_node, NULL);
-	install_node(&link_params_node, NULL);
-	install_node(&logicalrouter_node, NULL);
-	install_node(&vrf_node, NULL);
-	install_node(&nh_group_node, NULL);
-	install_node(&rmap_node, NULL);
-	install_node(&pbr_map_node, NULL);
-	install_node(&zebra_node, NULL);
-	install_node(&bgp_vpnv4_node, NULL);
-	install_node(&bgp_vpnv6_node, NULL);
-	install_node(&bgp_flowspecv4_node, NULL);
-	install_node(&bgp_flowspecv6_node, NULL);
-	install_node(&bgp_ipv4_node, NULL);
-	install_node(&bgp_ipv4m_node, NULL);
-	install_node(&bgp_ipv4l_node, NULL);
-	install_node(&bgp_ipv6_node, NULL);
-	install_node(&bgp_ipv6m_node, NULL);
-	install_node(&bgp_ipv6l_node, NULL);
-	install_node(&bgp_vrf_policy_node, NULL);
-	install_node(&bgp_evpn_node, NULL);
-	install_node(&bgp_evpn_vni_node, NULL);
-	install_node(&bgp_vnc_defaults_node, NULL);
-	install_node(&bgp_vnc_nve_group_node, NULL);
-	install_node(&bgp_vnc_l2_group_node, NULL);
-	install_node(&ospf_node, NULL);
-	install_node(&eigrp_node, NULL);
-	install_node(&babel_node, NULL);
-	install_node(&ripng_node, NULL);
-	install_node(&ospf6_node, NULL);
-	install_node(&ldp_node, NULL);
-	install_node(&ldp_ipv4_node, NULL);
-	install_node(&ldp_ipv6_node, NULL);
-	install_node(&ldp_ipv4_iface_node, NULL);
-	install_node(&ldp_ipv6_iface_node, NULL);
-	install_node(&ldp_l2vpn_node, NULL);
-	install_node(&ldp_pseudowire_node, NULL);
-	install_node(&keychain_node, NULL);
-	install_node(&keychain_key_node, NULL);
-	install_node(&isis_node, NULL);
-	install_node(&openfabric_node, NULL);
-	install_node(&vty_node, NULL);
-	install_node(&rpki_node, NULL);
+	/* bgpd */
+#ifdef HAVE_BGPD
+	install_node(&bgp_node);
+	install_element(CONFIG_NODE, &router_bgp_cmd);
+	install_element(BGP_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_NODE, &vtysh_end_all_cmd);
+
+	install_node(&bgp_vpnv4_node);
+	install_element(BGP_NODE, &address_family_ipv4_vpn_cmd);
+#ifdef KEEP_OLD_VPN_COMMANDS
+	install_element(BGP_NODE, &address_family_vpnv4_cmd);
+#endif /* KEEP_OLD_VPN_COMMANDS */
+	install_element(BGP_VPNV4_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_VPNV4_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_VPNV4_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_VPNV4_NODE, &exit_address_family_cmd);
+
+	install_node(&bgp_vpnv6_node);
+	install_element(BGP_NODE, &address_family_ipv6_vpn_cmd);
+#ifdef KEEP_OLD_VPN_COMMANDS
+	install_element(BGP_NODE, &address_family_vpnv6_cmd);
+#endif /* KEEP_OLD_VPN_COMMANDS */
+	install_element(BGP_VPNV6_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_VPNV6_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_VPNV6_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_VPNV6_NODE, &exit_address_family_cmd);
+
+	install_node(&bgp_flowspecv4_node);
+	install_element(BGP_NODE, &address_family_flowspecv4_cmd);
+	install_element(BGP_FLOWSPECV4_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_FLOWSPECV4_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_FLOWSPECV4_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_FLOWSPECV4_NODE, &exit_address_family_cmd);
+
+	install_node(&bgp_flowspecv6_node);
+	install_element(BGP_NODE, &address_family_flowspecv6_cmd);
+	install_element(BGP_FLOWSPECV6_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_FLOWSPECV6_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_FLOWSPECV6_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_FLOWSPECV6_NODE, &exit_address_family_cmd);
+
+	install_node(&bgp_ipv4_node);
+	install_element(BGP_NODE, &address_family_ipv4_cmd);
+	install_element(BGP_IPV4_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_IPV4_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_IPV4_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_IPV4_NODE, &exit_address_family_cmd);
+
+	install_node(&bgp_ipv4m_node);
+	install_element(BGP_NODE, &address_family_ipv4_multicast_cmd);
+	install_element(BGP_IPV4M_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_IPV4M_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_IPV4M_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_IPV4M_NODE, &exit_address_family_cmd);
+
+	install_node(&bgp_ipv4l_node);
+	install_element(BGP_NODE, &address_family_ipv4_labeled_unicast_cmd);
+	install_element(BGP_IPV4L_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_IPV4L_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_IPV4L_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_IPV4L_NODE, &exit_address_family_cmd);
+
+	install_node(&bgp_ipv6_node);
+	install_element(BGP_NODE, &address_family_ipv6_cmd);
+	install_element(BGP_IPV6_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_IPV6_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_IPV6_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_IPV6_NODE, &exit_address_family_cmd);
+
+	install_node(&bgp_ipv6m_node);
+	install_element(BGP_NODE, &address_family_ipv6_multicast_cmd);
+	install_element(BGP_IPV6M_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_IPV6M_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_IPV6M_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_IPV6M_NODE, &exit_address_family_cmd);
+
+	install_node(&bgp_ipv6l_node);
+	install_element(BGP_NODE, &address_family_ipv6_labeled_unicast_cmd);
+	install_element(BGP_IPV6L_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_IPV6L_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_IPV6L_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_IPV6L_NODE, &exit_address_family_cmd);
+
+#if defined(ENABLE_BGP_VNC)
+	install_node(&bgp_vrf_policy_node);
+	install_element(BGP_NODE, &vnc_vrf_policy_cmd);
+	install_element(BGP_VRF_POLICY_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_VRF_POLICY_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_VRF_POLICY_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_VRF_POLICY_NODE, &exit_vrf_policy_cmd);
+
+	install_node(&bgp_vnc_defaults_node);
+	install_element(BGP_NODE, &vnc_defaults_cmd);
+	install_element(BGP_VNC_DEFAULTS_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_VNC_DEFAULTS_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_VNC_DEFAULTS_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_VNC_DEFAULTS_NODE, &exit_vnc_config_cmd);
+
+	install_node(&bgp_vnc_nve_group_node);
+	install_element(BGP_NODE, &vnc_nve_group_cmd);
+	install_element(BGP_VNC_NVE_GROUP_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_VNC_NVE_GROUP_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_VNC_NVE_GROUP_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_VNC_NVE_GROUP_NODE, &exit_vnc_config_cmd);
+
+	install_node(&bgp_vnc_l2_group_node);
+	install_element(BGP_NODE, &vnc_l2_group_cmd);
+	install_element(BGP_VNC_L2_GROUP_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_VNC_L2_GROUP_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_VNC_L2_GROUP_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_VNC_L2_GROUP_NODE, &exit_vnc_config_cmd);
+#endif
+
+	install_node(&bgp_evpn_node);
+	install_element(BGP_NODE, &address_family_evpn_cmd);
+	install_element(BGP_EVPN_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_EVPN_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_EVPN_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_EVPN_NODE, &exit_address_family_cmd);
+
+	install_node(&bgp_evpn_vni_node);
+	install_element(BGP_EVPN_NODE, &bgp_evpn_vni_cmd);
+	install_element(BGP_EVPN_VNI_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_EVPN_VNI_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_EVPN_VNI_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_EVPN_VNI_NODE, &exit_vni_cmd);
+
+	install_node(&rpki_node);
+	install_element(CONFIG_NODE, &rpki_cmd);
+	install_element(RPKI_NODE, &rpki_exit_cmd);
+	install_element(RPKI_NODE, &rpki_quit_cmd);
+	install_element(RPKI_NODE, &vtysh_end_all_cmd);
+
+	install_node(&bmp_node);
+	install_element(BGP_NODE, &bmp_targets_cmd);
+	install_element(BMP_NODE, &bmp_exit_cmd);
+	install_element(BMP_NODE, &bmp_quit_cmd);
+	install_element(BMP_NODE, &vtysh_end_all_cmd);
+
+	install_node(&bgp_srv6_node);
+	install_element(BGP_NODE, &bgp_srv6_cmd);
+	install_element(BGP_SRV6_NODE, &exit_bgp_srv6_cmd);
+	install_element(BGP_SRV6_NODE, &quit_bgp_srv6_cmd);
+	install_element(BGP_SRV6_NODE, &vtysh_end_all_cmd);
+#endif /* HAVE_BGPD */
+
+	/* ripd */
+	install_node(&rip_node);
+#ifdef HAVE_RIPD
+	install_element(CONFIG_NODE, &router_rip_cmd);
+	install_element(RIP_NODE, &vtysh_exit_ripd_cmd);
+	install_element(RIP_NODE, &vtysh_quit_ripd_cmd);
+	install_element(RIP_NODE, &vtysh_end_all_cmd);
+#endif /* HAVE_RIPD */
+
+	/* ripngd */
+	install_node(&ripng_node);
+#ifdef HAVE_RIPNGD
+	install_element(CONFIG_NODE, &router_ripng_cmd);
+	install_element(RIPNG_NODE, &vtysh_exit_ripngd_cmd);
+	install_element(RIPNG_NODE, &vtysh_quit_ripngd_cmd);
+	install_element(RIPNG_NODE, &vtysh_end_all_cmd);
+#endif /* HAVE_RIPNGD */
+
+	/* ospfd */
+#ifdef HAVE_OSPFD
+	install_node(&ospf_node);
+	install_element(CONFIG_NODE, &router_ospf_cmd);
+	install_element(OSPF_NODE, &vtysh_exit_ospfd_cmd);
+	install_element(OSPF_NODE, &vtysh_quit_ospfd_cmd);
+	install_element(OSPF_NODE, &vtysh_end_all_cmd);
+#endif /* HAVE_OSPFD */
+
+	/* ospf6d */
+#ifdef HAVE_OSPF6D
+	install_node(&ospf6_node);
+	install_element(CONFIG_NODE, &router_ospf6_cmd);
+	install_element(OSPF6_NODE, &vtysh_exit_ospf6d_cmd);
+	install_element(OSPF6_NODE, &vtysh_quit_ospf6d_cmd);
+	install_element(OSPF6_NODE, &vtysh_end_all_cmd);
+#endif /* HAVE_OSPF6D */
+
+	/* ldpd */
+#if defined(HAVE_LDPD)
+	install_node(&ldp_node);
+	install_element(CONFIG_NODE, &ldp_mpls_ldp_cmd);
+	install_element(LDP_NODE, &vtysh_exit_ldpd_cmd);
+	install_element(LDP_NODE, &vtysh_quit_ldpd_cmd);
+	install_element(LDP_NODE, &vtysh_end_all_cmd);
+
+	install_node(&ldp_ipv4_node);
+	install_element(LDP_NODE, &ldp_address_family_ipv4_cmd);
+	install_element(LDP_IPV4_NODE, &vtysh_exit_ldpd_cmd);
+	install_element(LDP_IPV4_NODE, &vtysh_quit_ldpd_cmd);
+	install_element(LDP_IPV4_NODE, &ldp_exit_address_family_cmd);
+	install_element(LDP_IPV4_NODE, &vtysh_end_all_cmd);
+
+	install_node(&ldp_ipv6_node);
+	install_element(LDP_NODE, &ldp_address_family_ipv6_cmd);
+	install_element(LDP_IPV6_NODE, &vtysh_exit_ldpd_cmd);
+	install_element(LDP_IPV6_NODE, &vtysh_quit_ldpd_cmd);
+	install_element(LDP_IPV6_NODE, &ldp_exit_address_family_cmd);
+	install_element(LDP_IPV6_NODE, &vtysh_end_all_cmd);
+
+	install_node(&ldp_ipv4_iface_node);
+	install_element(LDP_IPV4_NODE, &ldp_interface_ifname_cmd);
+	install_element(LDP_IPV4_IFACE_NODE, &vtysh_exit_ldpd_cmd);
+	install_element(LDP_IPV4_IFACE_NODE, &vtysh_quit_ldpd_cmd);
+	install_element(LDP_IPV4_IFACE_NODE, &vtysh_end_all_cmd);
+
+	install_node(&ldp_ipv6_iface_node);
+	install_element(LDP_IPV6_NODE, &ldp_interface_ifname_cmd);
+	install_element(LDP_IPV6_IFACE_NODE, &vtysh_exit_ldpd_cmd);
+	install_element(LDP_IPV6_IFACE_NODE, &vtysh_quit_ldpd_cmd);
+	install_element(LDP_IPV6_IFACE_NODE, &vtysh_end_all_cmd);
+
+	install_node(&ldp_l2vpn_node);
+	install_element(CONFIG_NODE, &ldp_l2vpn_word_type_vpls_cmd);
+	install_element(LDP_L2VPN_NODE, &vtysh_exit_ldpd_cmd);
+	install_element(LDP_L2VPN_NODE, &vtysh_quit_ldpd_cmd);
+	install_element(LDP_L2VPN_NODE, &vtysh_end_all_cmd);
+
+	install_node(&ldp_pseudowire_node);
+	install_element(LDP_L2VPN_NODE, &ldp_member_pseudowire_ifname_cmd);
+	install_element(LDP_PSEUDOWIRE_NODE, &vtysh_exit_ldpd_cmd);
+	install_element(LDP_PSEUDOWIRE_NODE, &vtysh_quit_ldpd_cmd);
+	install_element(LDP_PSEUDOWIRE_NODE, &vtysh_end_all_cmd);
+#endif
+
+	/* eigrpd */
+#ifdef HAVE_EIGRPD
+	install_node(&eigrp_node);
+	install_element(CONFIG_NODE, &router_eigrp_cmd);
+	install_element(EIGRP_NODE, &vtysh_exit_eigrpd_cmd);
+	install_element(EIGRP_NODE, &vtysh_quit_eigrpd_cmd);
+	install_element(EIGRP_NODE, &vtysh_end_all_cmd);
+#endif /* HAVE_EIGRPD */
+
+	/* babeld */
+#ifdef HAVE_BABELD
+	install_node(&babel_node);
+	install_element(CONFIG_NODE, &router_babel_cmd);
+	install_element(BABEL_NODE, &vtysh_exit_babeld_cmd);
+	install_element(BABEL_NODE, &vtysh_quit_babeld_cmd);
+	install_element(BABEL_NODE, &vtysh_end_all_cmd);
+#endif /* HAVE_BABELD */
+
+	/* isisd */
+#ifdef HAVE_ISISD
+	install_node(&isis_node);
+	install_element(CONFIG_NODE, &router_isis_cmd);
+	install_element(ISIS_NODE, &vtysh_exit_isisd_cmd);
+	install_element(ISIS_NODE, &vtysh_quit_isisd_cmd);
+	install_element(ISIS_NODE, &vtysh_end_all_cmd);
+#endif /* HAVE_ISISD */
+
+	/* fabricd */
+#ifdef HAVE_FABRICD
+	install_node(&openfabric_node);
+	install_element(CONFIG_NODE, &router_openfabric_cmd);
+	install_element(OPENFABRIC_NODE, &vtysh_exit_fabricd_cmd);
+	install_element(OPENFABRIC_NODE, &vtysh_quit_fabricd_cmd);
+	install_element(OPENFABRIC_NODE, &vtysh_end_all_cmd);
+#endif /* HAVE_FABRICD */
+
+	/* pbrd */
+#ifdef HAVE_PBRD
+	install_node(&pbr_map_node);
+	install_element(CONFIG_NODE, &vtysh_pbr_map_cmd);
+	install_element(CONFIG_NODE, &vtysh_no_pbr_map_cmd);
+	install_element(PBRMAP_NODE, &vtysh_exit_pbr_map_cmd);
+	install_element(PBRMAP_NODE, &vtysh_quit_pbr_map_cmd);
+	install_element(PBRMAP_NODE, &vtysh_end_all_cmd);
+#endif /* HAVE_PBRD */
+
+	/* bfdd */
 #if HAVE_BFDD > 0
-	install_node(&bfd_node, NULL);
-	install_node(&bfd_peer_node, NULL);
+	install_node(&bfd_node);
+	install_element(CONFIG_NODE, &bfd_enter_cmd);
+	install_element(BFD_NODE, &vtysh_exit_bfdd_cmd);
+	install_element(BFD_NODE, &vtysh_quit_bfdd_cmd);
+	install_element(BFD_NODE, &vtysh_end_all_cmd);
+
+	install_node(&bfd_peer_node);
+	install_element(BFD_NODE, &bfd_peer_enter_cmd);
+	install_element(BFD_PEER_NODE, &vtysh_exit_bfdd_cmd);
+	install_element(BFD_PEER_NODE, &vtysh_quit_bfdd_cmd);
+	install_element(BFD_PEER_NODE, &vtysh_end_all_cmd);
+
+	install_node(&bfd_profile_node);
+	install_element(BFD_NODE, &bfd_profile_enter_cmd);
+	install_element(BFD_PROFILE_NODE, &vtysh_exit_bfdd_cmd);
+	install_element(BFD_PROFILE_NODE, &vtysh_quit_bfdd_cmd);
+	install_element(BFD_PROFILE_NODE, &vtysh_end_all_cmd);
 #endif /* HAVE_BFDD */
+
+	install_node(&segment_routing_node);
+	install_element(CONFIG_NODE, &segment_routing_cmd);
+	install_element(SEGMENT_ROUTING_NODE, &vtysh_exit_sr_cmd);
+	install_element(SEGMENT_ROUTING_NODE, &vtysh_quit_sr_cmd);
+	install_element(SEGMENT_ROUTING_NODE, &vtysh_end_all_cmd);
+
+#if defined(HAVE_PATHD)
+	install_node(&sr_traffic_eng_node);
+	install_node(&srte_segment_list_node);
+	install_node(&srte_policy_node);
+	install_node(&srte_candidate_dyn_node);
+
+	install_element(SR_TRAFFIC_ENG_NODE, &vtysh_exit_pathd_cmd);
+	install_element(SR_TRAFFIC_ENG_NODE, &vtysh_quit_pathd_cmd);
+	install_element(SR_SEGMENT_LIST_NODE, &vtysh_exit_pathd_cmd);
+	install_element(SR_SEGMENT_LIST_NODE, &vtysh_quit_pathd_cmd);
+	install_element(SR_POLICY_NODE, &vtysh_exit_pathd_cmd);
+	install_element(SR_POLICY_NODE, &vtysh_quit_pathd_cmd);
+	install_element(SR_CANDIDATE_DYN_NODE, &vtysh_exit_pathd_cmd);
+	install_element(SR_CANDIDATE_DYN_NODE, &vtysh_quit_pathd_cmd);
+
+
+	install_element(SR_TRAFFIC_ENG_NODE, &vtysh_end_all_cmd);
+	install_element(SR_SEGMENT_LIST_NODE, &vtysh_end_all_cmd);
+	install_element(SR_POLICY_NODE, &vtysh_end_all_cmd);
+	install_element(SR_CANDIDATE_DYN_NODE, &vtysh_end_all_cmd);
+
+	install_element(SEGMENT_ROUTING_NODE, &sr_traffic_eng_cmd);
+	install_element(SR_TRAFFIC_ENG_NODE, &srte_segment_list_cmd);
+	install_element(SR_TRAFFIC_ENG_NODE, &srte_policy_cmd);
+	install_element(SR_POLICY_NODE, &srte_policy_candidate_dyn_path_cmd);
+
+	install_node(&pcep_node);
+	install_node(&pcep_pcc_node);
+	install_node(&pcep_pce_node);
+	install_node(&pcep_pce_config_node);
+
+	install_element(PCEP_NODE, &vtysh_exit_pathd_cmd);
+	install_element(PCEP_NODE, &vtysh_quit_pathd_cmd);
+	install_element(PCEP_PCC_NODE, &vtysh_exit_pathd_cmd);
+	install_element(PCEP_PCC_NODE, &vtysh_quit_pathd_cmd);
+	install_element(PCEP_PCE_NODE, &vtysh_exit_pathd_cmd);
+	install_element(PCEP_PCE_NODE, &vtysh_quit_pathd_cmd);
+	install_element(PCEP_PCE_CONFIG_NODE, &vtysh_exit_pathd_cmd);
+	install_element(PCEP_PCE_CONFIG_NODE, &vtysh_quit_pathd_cmd);
+
+	install_element(PCEP_NODE, &vtysh_end_all_cmd);
+	install_element(PCEP_PCC_NODE, &vtysh_end_all_cmd);
+	install_element(PCEP_PCE_NODE, &vtysh_end_all_cmd);
+	install_element(PCEP_PCE_CONFIG_NODE, &vtysh_end_all_cmd);
+
+	install_element(SR_TRAFFIC_ENG_NODE, &pcep_cmd);
+	install_element(PCEP_NODE, &pcep_cli_pcc_cmd);
+	install_element(PCEP_NODE, &pcep_cli_pcep_pce_config_cmd);
+	install_element(PCEP_NODE, &pcep_cli_pce_cmd);
+
+#endif /* HAVE_PATHD */
+
+	/* keychain */
+	install_node(&keychain_node);
+	install_element(CONFIG_NODE, &key_chain_cmd);
+	install_element(KEYCHAIN_NODE, &key_chain_cmd);
+	install_element(KEYCHAIN_NODE, &vtysh_exit_keys_cmd);
+	install_element(KEYCHAIN_NODE, &vtysh_quit_keys_cmd);
+	install_element(KEYCHAIN_NODE, &vtysh_end_all_cmd);
+
+	install_node(&keychain_key_node);
+	install_element(KEYCHAIN_NODE, &key_cmd);
+	install_element(KEYCHAIN_KEY_NODE, &key_chain_cmd);
+	install_element(KEYCHAIN_KEY_NODE, &vtysh_exit_keys_cmd);
+	install_element(KEYCHAIN_KEY_NODE, &vtysh_quit_keys_cmd);
+	install_element(KEYCHAIN_KEY_NODE, &vtysh_end_all_cmd);
+
+	/* nexthop-group */
+	install_node(&nh_group_node);
+	install_element(CONFIG_NODE, &vtysh_nexthop_group_cmd);
+	install_element(CONFIG_NODE, &vtysh_no_nexthop_group_cmd);
+	install_element(NH_GROUP_NODE, &vtysh_end_all_cmd);
+	install_element(NH_GROUP_NODE, &vtysh_exit_nexthop_group_cmd);
+	install_element(NH_GROUP_NODE, &vtysh_quit_nexthop_group_cmd);
+
+	/* zebra and all */
+	install_node(&zebra_node);
+
+	install_node(&interface_node);
+	install_element(CONFIG_NODE, &vtysh_interface_cmd);
+	install_element(INTERFACE_NODE, &vtysh_end_all_cmd);
+	install_element(INTERFACE_NODE, &vtysh_exit_interface_cmd);
+	install_element(INTERFACE_NODE, &vtysh_quit_interface_cmd);
+
+	install_node(&link_params_node);
+	install_element(INTERFACE_NODE, &vtysh_link_params_cmd);
+	install_element(LINK_PARAMS_NODE, &exit_link_params_cmd);
+	install_element(LINK_PARAMS_NODE, &vtysh_end_all_cmd);
+	install_element(LINK_PARAMS_NODE, &vtysh_exit_link_params_cmd);
+	install_element(LINK_PARAMS_NODE, &vtysh_quit_link_params_cmd);
+
+	install_node(&pw_node);
+	install_element(CONFIG_NODE, &vtysh_pseudowire_cmd);
+	install_element(PW_NODE, &vtysh_end_all_cmd);
+	install_element(PW_NODE, &vtysh_exit_pseudowire_cmd);
+	install_element(PW_NODE, &vtysh_quit_pseudowire_cmd);
+
+	install_node(&vrf_node);
+	install_element(CONFIG_NODE, &vtysh_vrf_cmd);
+	install_element(VRF_NODE, &exit_vrf_config_cmd);
+	install_element(VRF_NODE, &vtysh_end_all_cmd);
+	install_element(VRF_NODE, &vtysh_exit_vrf_cmd);
+	install_element(VRF_NODE, &vtysh_quit_vrf_cmd);
+
+	install_node(&rmap_node);
+	install_element(CONFIG_NODE, &vtysh_route_map_cmd);
+	install_element(RMAP_NODE, &vtysh_exit_rmap_cmd);
+	install_element(RMAP_NODE, &vtysh_quit_rmap_cmd);
+	install_element(RMAP_NODE, &vtysh_end_all_cmd);
+
+	install_node(&vty_node);
+	install_element(CONFIG_NODE, &vtysh_line_vty_cmd);
+	install_element(VTY_NODE, &vtysh_exit_line_vty_cmd);
+	install_element(VTY_NODE, &vtysh_quit_line_vty_cmd);
+	install_element(VTY_NODE, &vtysh_end_all_cmd);
+
 
 	struct cmd_node *node;
 	for (unsigned int i = 0; i < vector_active(cmdvec); i++) {
@@ -3546,7 +4824,10 @@ void vtysh_init_vty(void)
 		vtysh_install_default(node->node);
 	}
 
-	install_element(VIEW_NODE, &vtysh_enable_cmd);
+	/* vtysh */
+
+	if (!user_mode)
+		install_element(VIEW_NODE, &vtysh_enable_cmd);
 	install_element(ENABLE_NODE, &vtysh_config_terminal_cmd);
 	install_element(ENABLE_NODE, &vtysh_disable_cmd);
 
@@ -3555,258 +4836,30 @@ void vtysh_init_vty(void)
 	install_element(CONFIG_NODE, &vtysh_exit_all_cmd);
 	install_element(VIEW_NODE, &vtysh_quit_all_cmd);
 	install_element(CONFIG_NODE, &vtysh_quit_all_cmd);
-	install_element(RIP_NODE, &vtysh_exit_ripd_cmd);
-	install_element(RIP_NODE, &vtysh_quit_ripd_cmd);
-	install_element(RIPNG_NODE, &vtysh_exit_ripngd_cmd);
-	install_element(RIPNG_NODE, &vtysh_quit_ripngd_cmd);
-	install_element(OSPF_NODE, &vtysh_exit_ospfd_cmd);
-	install_element(OSPF_NODE, &vtysh_quit_ospfd_cmd);
-	install_element(EIGRP_NODE, &vtysh_exit_eigrpd_cmd);
-	install_element(EIGRP_NODE, &vtysh_quit_eigrpd_cmd);
-	install_element(BABEL_NODE, &vtysh_exit_babeld_cmd);
-	install_element(BABEL_NODE, &vtysh_quit_babeld_cmd);
-	install_element(OSPF6_NODE, &vtysh_exit_ospf6d_cmd);
-	install_element(OSPF6_NODE, &vtysh_quit_ospf6d_cmd);
-#if defined(HAVE_LDPD)
-	install_element(LDP_NODE, &vtysh_exit_ldpd_cmd);
-	install_element(LDP_NODE, &vtysh_quit_ldpd_cmd);
-	install_element(LDP_IPV4_NODE, &vtysh_exit_ldpd_cmd);
-	install_element(LDP_IPV4_NODE, &vtysh_quit_ldpd_cmd);
-	install_element(LDP_IPV4_NODE, &ldp_exit_address_family_cmd);
-	install_element(LDP_IPV6_NODE, &vtysh_exit_ldpd_cmd);
-	install_element(LDP_IPV6_NODE, &vtysh_quit_ldpd_cmd);
-	install_element(LDP_IPV6_NODE, &ldp_exit_address_family_cmd);
-	install_element(LDP_IPV4_IFACE_NODE, &vtysh_exit_ldpd_cmd);
-	install_element(LDP_IPV4_IFACE_NODE, &vtysh_quit_ldpd_cmd);
-	install_element(LDP_IPV6_IFACE_NODE, &vtysh_exit_ldpd_cmd);
-	install_element(LDP_IPV6_IFACE_NODE, &vtysh_quit_ldpd_cmd);
-	install_element(LDP_L2VPN_NODE, &vtysh_exit_ldpd_cmd);
-	install_element(LDP_L2VPN_NODE, &vtysh_quit_ldpd_cmd);
-	install_element(LDP_PSEUDOWIRE_NODE, &vtysh_exit_ldpd_cmd);
-	install_element(LDP_PSEUDOWIRE_NODE, &vtysh_quit_ldpd_cmd);
-#endif
-	install_element(BGP_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_VPNV4_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_VPNV4_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_VPNV6_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_VPNV6_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_FLOWSPECV4_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_FLOWSPECV4_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_FLOWSPECV6_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_FLOWSPECV6_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_IPV4_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_IPV4_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_IPV4M_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_IPV4M_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_IPV4L_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_IPV4L_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_IPV6_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_IPV6_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_IPV6M_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_IPV6M_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_EVPN_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_EVPN_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_EVPN_VNI_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_EVPN_VNI_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_IPV6L_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_IPV6L_NODE, &vtysh_quit_bgpd_cmd);
-#if defined(ENABLE_BGP_VNC)
-	install_element(BGP_VRF_POLICY_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_VRF_POLICY_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_VNC_DEFAULTS_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_VNC_DEFAULTS_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_VNC_NVE_GROUP_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_VNC_NVE_GROUP_NODE, &vtysh_quit_bgpd_cmd);
-	install_element(BGP_VNC_L2_GROUP_NODE, &vtysh_exit_bgpd_cmd);
-	install_element(BGP_VNC_L2_GROUP_NODE, &vtysh_quit_bgpd_cmd);
-#endif
-	install_element(ISIS_NODE, &vtysh_exit_isisd_cmd);
-	install_element(ISIS_NODE, &vtysh_quit_isisd_cmd);
-	install_element(OPENFABRIC_NODE, &vtysh_exit_fabricd_cmd);
-	install_element(OPENFABRIC_NODE, &vtysh_quit_fabricd_cmd);
-	install_element(KEYCHAIN_NODE, &vtysh_exit_ripd_cmd);
-	install_element(KEYCHAIN_NODE, &vtysh_quit_ripd_cmd);
-	install_element(KEYCHAIN_KEY_NODE, &vtysh_exit_ripd_cmd);
-	install_element(KEYCHAIN_KEY_NODE, &vtysh_quit_ripd_cmd);
-	install_element(RMAP_NODE, &vtysh_exit_rmap_cmd);
-	install_element(RMAP_NODE, &vtysh_quit_rmap_cmd);
-	install_element(PBRMAP_NODE, &vtysh_exit_pbr_map_cmd);
-	install_element(PBRMAP_NODE, &vtysh_quit_pbr_map_cmd);
-#if HAVE_BFDD > 0
-	/* Enter node. */
-	install_element(CONFIG_NODE, &bfd_enter_cmd);
-	install_element(BFD_NODE, &bfd_peer_enter_cmd);
-
-	/* Exit/quit node. */
-	install_element(BFD_NODE, &vtysh_exit_bfdd_cmd);
-	install_element(BFD_NODE, &vtysh_quit_bfdd_cmd);
-	install_element(BFD_PEER_NODE, &vtysh_exit_bfdd_cmd);
-	install_element(BFD_PEER_NODE, &vtysh_quit_bfdd_cmd);
-
-	/* End/exit all. */
-	install_element(BFD_NODE, &vtysh_end_all_cmd);
-	install_element(BFD_PEER_NODE, &vtysh_end_all_cmd);
-#endif /* HAVE_BFDD */
-	install_element(VTY_NODE, &vtysh_exit_line_vty_cmd);
-	install_element(VTY_NODE, &vtysh_quit_line_vty_cmd);
 
 	/* "end" command. */
 	install_element(CONFIG_NODE, &vtysh_end_all_cmd);
 	install_element(ENABLE_NODE, &vtysh_end_all_cmd);
-	install_element(RIP_NODE, &vtysh_end_all_cmd);
-	install_element(RIPNG_NODE, &vtysh_end_all_cmd);
-	install_element(OSPF_NODE, &vtysh_end_all_cmd);
-	install_element(EIGRP_NODE, &vtysh_end_all_cmd);
-	install_element(BABEL_NODE, &vtysh_end_all_cmd);
-	install_element(OSPF6_NODE, &vtysh_end_all_cmd);
-	install_element(LDP_NODE, &vtysh_end_all_cmd);
-	install_element(LDP_IPV4_NODE, &vtysh_end_all_cmd);
-	install_element(LDP_IPV6_NODE, &vtysh_end_all_cmd);
-	install_element(LDP_IPV4_IFACE_NODE, &vtysh_end_all_cmd);
-	install_element(LDP_IPV6_IFACE_NODE, &vtysh_end_all_cmd);
-	install_element(LDP_L2VPN_NODE, &vtysh_end_all_cmd);
-	install_element(LDP_PSEUDOWIRE_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_IPV4_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_IPV4M_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_IPV4L_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_VPNV4_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_VPNV6_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_FLOWSPECV4_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_FLOWSPECV6_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_IPV6_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_IPV6M_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_IPV6L_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_VRF_POLICY_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_EVPN_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_EVPN_VNI_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_VNC_DEFAULTS_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_VNC_NVE_GROUP_NODE, &vtysh_end_all_cmd);
-	install_element(BGP_VNC_L2_GROUP_NODE, &vtysh_end_all_cmd);
-	install_element(ISIS_NODE, &vtysh_end_all_cmd);
-	install_element(OPENFABRIC_NODE, &vtysh_end_all_cmd);
-	install_element(KEYCHAIN_NODE, &vtysh_end_all_cmd);
-	install_element(KEYCHAIN_KEY_NODE, &vtysh_end_all_cmd);
-	install_element(RMAP_NODE, &vtysh_end_all_cmd);
-	install_element(PBRMAP_NODE, &vtysh_end_all_cmd);
-	install_element(VTY_NODE, &vtysh_end_all_cmd);
 
-	install_element(INTERFACE_NODE, &vtysh_end_all_cmd);
-	install_element(INTERFACE_NODE, &vtysh_exit_interface_cmd);
-	install_element(LINK_PARAMS_NODE, &exit_link_params_cmd);
-	install_element(LINK_PARAMS_NODE, &vtysh_end_all_cmd);
-	install_element(LINK_PARAMS_NODE, &vtysh_exit_interface_cmd);
-	install_element(INTERFACE_NODE, &vtysh_quit_interface_cmd);
+	/* SRv6 Data-plane */
+	install_node(&srv6_node);
+	install_element(SEGMENT_ROUTING_NODE, &srv6_cmd);
+	install_element(SRV6_NODE, &srv6_locators_cmd);
+	install_element(SRV6_NODE, &exit_srv6_config_cmd);
+	install_element(SRV6_NODE, &vtysh_end_all_cmd);
 
-	install_element(PW_NODE, &vtysh_end_all_cmd);
-	install_element(PW_NODE, &vtysh_exit_interface_cmd);
-	install_element(PW_NODE, &vtysh_quit_interface_cmd);
+	install_node(&srv6_locs_node);
+	install_element(SRV6_LOCS_NODE, &srv6_locator_cmd);
+	install_element(SRV6_LOCS_NODE, &exit_srv6_locs_config_cmd);
+	install_element(SRV6_LOCS_NODE, &vtysh_end_all_cmd);
 
-	install_element(LOGICALROUTER_NODE, &vtysh_end_all_cmd);
+	install_node(&srv6_loc_node);
+	install_element(SRV6_LOC_NODE, &exit_srv6_loc_config_cmd);
+	install_element(SRV6_LOC_NODE, &vtysh_end_all_cmd);
 
-	install_element(CONFIG_NODE, &vtysh_logicalrouter_cmd);
-	install_element(CONFIG_NODE, &vtysh_no_logicalrouter_cmd);
-	install_element(LOGICALROUTER_NODE, &vtysh_exit_logicalrouter_cmd);
-	install_element(LOGICALROUTER_NODE, &vtysh_quit_logicalrouter_cmd);
-
-	install_element(CONFIG_NODE, &vtysh_nexthop_group_cmd);
-	install_element(NH_GROUP_NODE, &vtysh_end_all_cmd);
-	install_element(NH_GROUP_NODE, &vtysh_exit_nexthop_group_cmd);
-	install_element(NH_GROUP_NODE, &vtysh_quit_nexthop_group_cmd);
-
-	install_element(VRF_NODE, &vtysh_end_all_cmd);
-	install_element(VRF_NODE, &vtysh_exit_vrf_cmd);
-	install_element(VRF_NODE, &vtysh_quit_vrf_cmd);
-
-	install_element(CONFIG_NODE, &router_eigrp_cmd);
-	install_element(CONFIG_NODE, &router_babel_cmd);
-	install_element(CONFIG_NODE, &router_rip_cmd);
-	install_element(CONFIG_NODE, &router_ripng_cmd);
-	install_element(CONFIG_NODE, &router_ospf_cmd);
-	install_element(CONFIG_NODE, &router_ospf6_cmd);
-#if defined(HAVE_LDPD)
-	install_element(CONFIG_NODE, &ldp_mpls_ldp_cmd);
-	install_element(LDP_NODE, &ldp_address_family_ipv4_cmd);
-	install_element(LDP_NODE, &ldp_address_family_ipv6_cmd);
-	install_element(LDP_IPV4_NODE, &ldp_interface_ifname_cmd);
-	install_element(LDP_IPV6_NODE, &ldp_interface_ifname_cmd);
-	install_element(CONFIG_NODE, &ldp_l2vpn_word_type_vpls_cmd);
-	install_element(LDP_L2VPN_NODE, &ldp_member_pseudowire_ifname_cmd);
-#endif
-	install_element(CONFIG_NODE, &router_isis_cmd);
-	install_element(CONFIG_NODE, &router_openfabric_cmd);
-	install_element(CONFIG_NODE, &router_bgp_cmd);
-#ifdef KEEP_OLD_VPN_COMMANDS
-	install_element(BGP_NODE, &address_family_vpnv4_cmd);
-	install_element(BGP_NODE, &address_family_vpnv6_cmd);
-#endif /* KEEP_OLD_VPN_COMMANDS */
-#if defined(ENABLE_BGP_VNC)
-	install_element(BGP_NODE, &vnc_vrf_policy_cmd);
-	install_element(BGP_NODE, &vnc_defaults_cmd);
-	install_element(BGP_NODE, &vnc_nve_group_cmd);
-	install_element(BGP_NODE, &vnc_l2_group_cmd);
-#endif
-	install_element(BGP_NODE, &address_family_ipv4_cmd);
-	install_element(BGP_NODE, &address_family_ipv4_multicast_cmd);
-	install_element(BGP_NODE, &address_family_ipv4_vpn_cmd);
-	install_element(BGP_NODE, &address_family_ipv4_labeled_unicast_cmd);
-	install_element(BGP_NODE, &address_family_ipv6_cmd);
-	install_element(BGP_NODE, &address_family_ipv6_multicast_cmd);
-	install_element(BGP_NODE, &address_family_ipv6_vpn_cmd);
-	install_element(BGP_NODE, &address_family_ipv6_labeled_unicast_cmd);
-	install_element(BGP_NODE, &address_family_evpn_cmd);
-	install_element(BGP_NODE, &address_family_flowspecv4_cmd);
-	install_element(BGP_NODE, &address_family_flowspecv6_cmd);
-#if defined(HAVE_CUMULUS)
-	install_element(BGP_NODE, &address_family_evpn2_cmd);
-#endif
-	install_element(BGP_VPNV4_NODE, &exit_address_family_cmd);
-	install_element(BGP_VPNV6_NODE, &exit_address_family_cmd);
-	install_element(BGP_IPV4_NODE, &exit_address_family_cmd);
-	install_element(BGP_IPV4M_NODE, &exit_address_family_cmd);
-	install_element(BGP_IPV4L_NODE, &exit_address_family_cmd);
-	install_element(BGP_IPV6_NODE, &exit_address_family_cmd);
-	install_element(BGP_IPV6M_NODE, &exit_address_family_cmd);
-	install_element(BGP_EVPN_NODE, &exit_address_family_cmd);
-	install_element(BGP_IPV6L_NODE, &exit_address_family_cmd);
-	install_element(BGP_FLOWSPECV4_NODE, &exit_address_family_cmd);
-	install_element(BGP_FLOWSPECV6_NODE, &exit_address_family_cmd);
-
-	install_element(CONFIG_NODE, &rpki_cmd);
-	install_element(RPKI_NODE, &rpki_exit_cmd);
-	install_element(RPKI_NODE, &rpki_quit_cmd);
-	install_element(RPKI_NODE, &vtysh_end_all_cmd);
-
-	/* EVPN commands */
-	install_element(BGP_EVPN_NODE, &bgp_evpn_vni_cmd);
-	install_element(BGP_EVPN_VNI_NODE, &exit_vni_cmd);
-
-	install_element(BGP_VRF_POLICY_NODE, &exit_vrf_policy_cmd);
-	install_element(BGP_VNC_DEFAULTS_NODE, &exit_vnc_config_cmd);
-	install_element(BGP_VNC_NVE_GROUP_NODE, &exit_vnc_config_cmd);
-	install_element(BGP_VNC_L2_GROUP_NODE, &exit_vnc_config_cmd);
-
-	install_element(CONFIG_NODE, &key_chain_cmd);
-	install_element(CONFIG_NODE, &vtysh_route_map_cmd);
-	install_element(CONFIG_NODE, &vtysh_pbr_map_cmd);
-	install_element(CONFIG_NODE, &vtysh_no_pbr_map_cmd);
-	install_element(CONFIG_NODE, &vtysh_line_vty_cmd);
-	install_element(KEYCHAIN_NODE, &key_cmd);
-	install_element(KEYCHAIN_NODE, &key_chain_cmd);
-	install_element(KEYCHAIN_KEY_NODE, &key_chain_cmd);
-	install_element(CONFIG_NODE, &vtysh_interface_cmd);
-	install_element(CONFIG_NODE, &vtysh_pseudowire_cmd);
-	install_element(INTERFACE_NODE, &vtysh_link_params_cmd);
 	install_element(ENABLE_NODE, &vtysh_show_running_config_cmd);
 	install_element(ENABLE_NODE, &vtysh_copy_running_config_cmd);
-
-	install_element(CONFIG_NODE, &vtysh_vrf_cmd);
-	install_element(VRF_NODE, &vtysh_vrf_netns_cmd);
-	install_element(VRF_NODE, &vtysh_no_vrf_netns_cmd);
-	install_element(VRF_NODE, &exit_vrf_config_cmd);
-
-	install_element(CONFIG_NODE, &vtysh_no_nexthop_group_cmd);
+	install_element(ENABLE_NODE, &vtysh_copy_to_running_cmd);
 
 	/* "write terminal" command. */
 	install_element(ENABLE_NODE, &vtysh_write_terminal_cmd);
@@ -3822,6 +4875,9 @@ void vtysh_init_vty(void)
 	install_element(VIEW_NODE, &vtysh_terminal_length_cmd);
 	install_element(VIEW_NODE, &vtysh_terminal_no_length_cmd);
 	install_element(VIEW_NODE, &vtysh_show_daemons_cmd);
+
+	install_element(VIEW_NODE, &vtysh_terminal_monitor_cmd);
+	install_element(VIEW_NODE, &no_vtysh_terminal_monitor_cmd);
 
 	install_element(VIEW_NODE, &vtysh_ping_cmd);
 	install_element(VIEW_NODE, &vtysh_ping_ip_cmd);
@@ -3842,41 +4898,42 @@ void vtysh_init_vty(void)
 #endif
 
 	/* debugging */
-	install_element(VIEW_NODE, &vtysh_show_debugging_cmd);
 	install_element(VIEW_NODE, &vtysh_show_error_code_cmd);
-	install_element(VIEW_NODE, &vtysh_show_debugging_hashtable_cmd);
+	install_element(ENABLE_NODE, &vtysh_show_debugging_cmd);
+	install_element(ENABLE_NODE, &vtysh_show_debugging_hashtable_cmd);
 	install_element(ENABLE_NODE, &vtysh_debug_all_cmd);
 	install_element(CONFIG_NODE, &vtysh_debug_all_cmd);
+	install_element(ENABLE_NODE, &vtysh_debug_memstats_cmd);
+	install_element(CONFIG_NODE, &vtysh_debug_memstats_cmd);
+	install_element(ENABLE_NODE, &vtysh_debug_uid_backtrace_cmd);
+	install_element(CONFIG_NODE, &vtysh_debug_uid_backtrace_cmd);
+
+	/* northbound */
+	install_element(ENABLE_NODE, &show_config_running_cmd);
+	install_element(ENABLE_NODE, &show_yang_operational_data_cmd);
+	install_element(ENABLE_NODE, &show_yang_module_cmd);
+	install_element(ENABLE_NODE, &show_yang_module_detail_cmd);
+	install_element(ENABLE_NODE, &debug_nb_cmd);
+	install_element(CONFIG_NODE, &debug_nb_cmd);
 
 	/* misc lib show commands */
+	install_element(VIEW_NODE, &vtysh_show_history_cmd);
 	install_element(VIEW_NODE, &vtysh_show_memory_cmd);
 	install_element(VIEW_NODE, &vtysh_show_modules_cmd);
 	install_element(VIEW_NODE, &vtysh_show_work_queues_cmd);
 	install_element(VIEW_NODE, &vtysh_show_work_queues_daemon_cmd);
 	install_element(VIEW_NODE, &vtysh_show_thread_cmd);
 	install_element(VIEW_NODE, &vtysh_show_poll_cmd);
+	install_element(VIEW_NODE, &vtysh_show_thread_timer_cmd);
 
 	/* Logging */
 	install_element(VIEW_NODE, &vtysh_show_logging_cmd);
-	install_element(CONFIG_NODE, &vtysh_log_stdout_cmd);
-	install_element(CONFIG_NODE, &vtysh_log_stdout_level_cmd);
-	install_element(CONFIG_NODE, &no_vtysh_log_stdout_cmd);
-	install_element(CONFIG_NODE, &vtysh_log_file_cmd);
-	install_element(CONFIG_NODE, &vtysh_log_file_level_cmd);
-	install_element(CONFIG_NODE, &no_vtysh_log_file_cmd);
-	install_element(CONFIG_NODE, &vtysh_log_monitor_cmd);
-	install_element(CONFIG_NODE, &no_vtysh_log_monitor_cmd);
-	install_element(CONFIG_NODE, &vtysh_log_syslog_cmd);
-	install_element(CONFIG_NODE, &no_vtysh_log_syslog_cmd);
-	install_element(CONFIG_NODE, &vtysh_log_facility_cmd);
-	install_element(CONFIG_NODE, &no_vtysh_log_facility_cmd);
-	install_element(CONFIG_NODE, &vtysh_log_record_priority_cmd);
-	install_element(CONFIG_NODE, &no_vtysh_log_record_priority_cmd);
-	install_element(CONFIG_NODE, &vtysh_log_timestamp_precision_cmd);
-	install_element(CONFIG_NODE, &no_vtysh_log_timestamp_precision_cmd);
 
 	install_element(CONFIG_NODE, &vtysh_service_password_encrypt_cmd);
 	install_element(CONFIG_NODE, &no_vtysh_service_password_encrypt_cmd);
+
+	install_element(CONFIG_NODE, &vtysh_allow_reserved_ranges_cmd);
+	install_element(CONFIG_NODE, &no_vtysh_allow_reserved_ranges_cmd);
 
 	install_element(CONFIG_NODE, &vtysh_password_cmd);
 	install_element(CONFIG_NODE, &no_vtysh_password_cmd);

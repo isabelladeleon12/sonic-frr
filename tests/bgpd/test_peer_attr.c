@@ -29,6 +29,7 @@
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_zebra.h"
+#include "bgpd/bgp_network.h"
 
 #ifdef ENABLE_BGP_VNC
 #include "bgpd/rfapi/rfapi_backend.h"
@@ -1170,7 +1171,7 @@ static void test_peer_attr(struct test *test, struct test_peer_attr *pa)
 	/* Test Preparation: Switch and activate address-family. */
 	if (!is_attr_type_global(pa->type)) {
 		test_log(test, "prepare: switch address-family to [%s]",
-			 afi_safi_print(pa->afi, pa->safi));
+			 get_afi_safi_str(pa->afi, pa->safi, false));
 		test_execute(test, "address-family %s %s",
 			     str_from_afi(pa->afi), str_from_safi(pa->safi));
 		test_execute(test, "neighbor %s activate", g->name);
@@ -1237,7 +1238,7 @@ static void test_peer_attr(struct test *test, struct test_peer_attr *pa)
 	/* Test Preparation: Switch and activate address-family. */
 	if (!is_attr_type_global(pa->type)) {
 		test_log(test, "prepare: switch address-family to [%s]",
-			 afi_safi_print(pa->afi, pa->safi));
+			 get_afi_safi_str(pa->afi, pa->safi, false));
 		test_execute(test, "address-family %s %s",
 			     str_from_afi(pa->afi), str_from_safi(pa->safi));
 		test_execute(test, "neighbor %s activate", g->name);
@@ -1285,7 +1286,7 @@ static void test_peer_attr(struct test *test, struct test_peer_attr *pa)
 	/* Test Preparation: Switch and activate address-family. */
 	if (!is_attr_type_global(pa->type)) {
 		test_log(test, "prepare: switch address-family to [%s]",
-			 afi_safi_print(pa->afi, pa->safi));
+			 get_afi_safi_str(pa->afi, pa->safi, false));
 		test_execute(test, "address-family %s %s",
 			     str_from_afi(pa->afi), str_from_safi(pa->safi));
 		test_execute(test, "neighbor %s activate", g->name);
@@ -1380,17 +1381,16 @@ static void test_peer_attr(struct test *test, struct test_peer_attr *pa)
 static void bgp_startup(void)
 {
 	cmd_init(1);
-	openzlog("testbgpd", "NONE", 0, LOG_CONS | LOG_NDELAY | LOG_PID,
-		 LOG_DAEMON);
+	zlog_aux_init("NONE: ", LOG_DEBUG);
 	zprivs_preinit(&bgpd_privs);
 	zprivs_init(&bgpd_privs);
 
 	master = thread_master_create(NULL);
-	yang_init();
-	nb_init(master, NULL, 0);
-	bgp_master_init(master);
+	nb_init(master, NULL, 0, false);
+	bgp_master_init(master, BGP_SOCKET_SNDBUF_SIZE, list_new());
 	bgp_option_set(BGP_OPT_NO_LISTEN);
-	vrf_init(NULL, NULL, NULL, NULL, NULL);
+	vrf_init(NULL, NULL, NULL, NULL);
+	frr_pthread_init();
 	bgp_init(0);
 	bgp_pthreads_run();
 }
@@ -1436,7 +1436,6 @@ static void bgp_shutdown(void)
 	zprivs_terminate(&bgpd_privs);
 	thread_master_free(master);
 	master = NULL;
-	closezlog();
 }
 
 int main(void)

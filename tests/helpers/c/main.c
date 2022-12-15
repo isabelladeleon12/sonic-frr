@@ -24,7 +24,7 @@
 #include "vty.h"
 #include "command.h"
 #include "memory.h"
-#include "memory_vty.h"
+#include "lib_vty.h"
 
 extern void test_init(void);
 
@@ -47,13 +47,12 @@ DEFUN (daemon_exit,
 }
 
 static int timer_count;
-static int test_timer(struct thread *thread)
+static void test_timer(struct thread *thread)
 {
 	int *count = THREAD_ARG(thread);
 
 	printf("run %d of timer\n", (*count)++);
 	thread_add_timer(master, test_timer, count, 5, NULL);
-	return 0;
 }
 
 static void test_timer_init(void)
@@ -153,10 +152,9 @@ int main(int argc, char **argv)
 
 	/* Library inits. */
 	cmd_init(1);
-	vty_init(master);
-	memory_init();
-	yang_init();
-	nb_init(master, NULL, 0);
+	vty_init(master, false);
+	lib_cmd_init();
+	nb_init(master, NULL, 0, false);
 
 	/* OSPF vty inits. */
 	test_vty_init();

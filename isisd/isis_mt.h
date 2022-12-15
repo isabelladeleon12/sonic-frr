@@ -3,7 +3,7 @@
  *
  * Copyright (C) 2017 Christian Franke
  *
- * This file is part of FreeRangeRouting (FRR)
+ * This file is part of FRRouting (FRR)
  *
  * FRR is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -27,15 +27,18 @@
 #define ISIS_MT_AT_MASK        0x4000
 
 #define ISIS_MT_IPV4_UNICAST   0
+#define ISIS_MT_STANDARD ISIS_MT_IPV4_UNICAST
 #define ISIS_MT_IPV4_MGMT      1
 #define ISIS_MT_IPV6_UNICAST   2
 #define ISIS_MT_IPV4_MULTICAST 3
 #define ISIS_MT_IPV6_MULTICAST 4
 #define ISIS_MT_IPV6_MGMT      5
 #define ISIS_MT_IPV6_DSTSRC    3996 /* FIXME: IANA */
+/* Use first Reserved Flag to indicate that there is no MT Topology active */
+#define ISIS_MT_DISABLE        4096
 
 #define ISIS_MT_NAMES                                                          \
-	"<ipv4-unicast"                                                        \
+	"<standard"                                                            \
 	"|ipv4-mgmt"                                                           \
 	"|ipv6-unicast"                                                        \
 	"|ipv4-multicast"                                                      \
@@ -116,10 +119,8 @@ bool tlvs_to_adj_mt_set(struct isis_tlvs *tlvs, bool v4_usable, bool v6_usable,
 bool adj_has_mt(struct isis_adjacency *adj, uint16_t mtid);
 void adj_mt_finish(struct isis_adjacency *adj);
 void tlvs_add_mt_bcast(struct isis_tlvs *tlvs, struct isis_circuit *circuit,
-		       int level, uint8_t *id, uint32_t metric,
-		       uint8_t *subtlvs, uint8_t subtlv_len);
+		       int level, uint8_t *id, uint32_t metric);
 void tlvs_add_mt_p2p(struct isis_tlvs *tlvs, struct isis_circuit *circuit,
-		     uint8_t *id, uint32_t metric, uint8_t *subtlvs,
-		     uint8_t subtlv_len);
+		     uint8_t *id, uint32_t metric);
 void mt_init(void);
 #endif

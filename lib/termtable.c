@@ -20,13 +20,14 @@
 #include <zebra.h>
 #include <stdio.h>
 
+#include "printfrr.h"
 #include "memory.h"
 #include "termtable.h"
 
-DEFINE_MTYPE_STATIC(LIB, TTABLE, "ASCII table")
+DEFINE_MTYPE_STATIC(LIB, TTABLE, "ASCII table");
 
 /* clang-format off */
-struct ttable_style ttable_styles[] = {
+const struct ttable_style ttable_styles[] = {
 	{	// default ascii
 		.corner = '+',
 		.rownums_on = false,
@@ -98,7 +99,7 @@ void ttable_del(struct ttable *tt)
 	XFREE(MTYPE_TTABLE, tt);
 }
 
-struct ttable *ttable_new(struct ttable_style *style)
+struct ttable *ttable_new(const struct ttable_style *style)
 {
 	struct ttable *tt;
 
@@ -134,6 +135,7 @@ static struct ttable_cell *ttable_insert_row_va(struct ttable *tt, int i,
 {
 	assert(i >= -1 && i < tt->nrows);
 
+	char shortbuf[256];
 	char *res, *orig, *section;
 	struct ttable_cell *row;
 	int col = 0;
@@ -158,9 +160,7 @@ static struct ttable_cell *ttable_insert_row_va(struct ttable *tt, int i,
 	/* CALLOC a block of cells */
 	row = XCALLOC(MTYPE_TTABLE, tt->ncols * sizeof(struct ttable_cell));
 
-	res = NULL;
-	vasprintf(&res, format, ap);
-
+	res = vasnprintfrr(MTYPE_TMP, shortbuf, sizeof(shortbuf), format, ap);
 	orig = res;
 
 	while (res && col < tt->ncols) {
@@ -170,7 +170,8 @@ static struct ttable_cell *ttable_insert_row_va(struct ttable *tt, int i,
 		col++;
 	}
 
-	free(orig);
+	if (orig != shortbuf)
+		XFREE(MTYPE_TMP, orig);
 
 	/* insert row */
 	if (i == -1 || i == tt->nrows)

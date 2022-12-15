@@ -18,23 +18,23 @@
  */
 
 
-#if !defined(GNU_LINUX) && (defined(SUNOS_5) || defined(OPEN_BSD))
-/* SUNOS_5 or OPEN_BSD */
+#if !defined(GNU_LINUX) && defined(OPEN_BSD)
+/* OPEN_BSD */
 
 #include <zebra.h>
 #include "ns.h"
 #include "log.h"
 #include "memory.h"
 
-DEFINE_MTYPE_STATIC(LIB, NS, "NetNS Context")
-DEFINE_MTYPE_STATIC(LIB, NS_NAME, "NetNS Name")
+DEFINE_MTYPE_STATIC(LIB, NS, "NetNS Context");
+DEFINE_MTYPE_STATIC(LIB, NS_NAME, "NetNS Name");
 
 
 static inline int ns_compare(const struct ns *ns, const struct ns *ns2);
 
 RB_GENERATE(ns_head, ns, entry, ns_compare)
 
-struct ns_head ns_tree = RB_INITIALIZER(&ns_tree);
+static struct ns_head ns_tree = RB_INITIALIZER(&ns_tree);
 
 static inline int ns_compare(const struct ns *a, const struct ns *b)
 {
@@ -82,7 +82,7 @@ const char *ns_get_name(struct ns *ns)
 }
 
 /* only called from vrf ( when removing netns from vrf)
- * or at VRF or logical router termination
+ * or at VRF termination
  */
 void ns_delete(struct ns *ns)
 {
@@ -109,13 +109,6 @@ void *ns_info_lookup(ns_id_t ns_id)
 void ns_init(void)
 {
 }
-
-/* API to retrieve default NS */
-ns_id_t ns_get_default_id(void)
-{
-	return NS_UNKNOWN;
-}
-
 
 /* API that can be used to change from NS */
 int ns_switchback_to_initial(void)

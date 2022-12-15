@@ -26,8 +26,7 @@
 #include <vty.h>
 #include <distribute.h>
 #include <vector.h>
-
-#include "ripng_memory.h"
+#include <memory.h>
 
 /* RIPng version and port number. */
 #define RIPNG_V1                         1
@@ -87,6 +86,8 @@
 #define RIPNG_INSTANCE	"/frr-ripngd:ripngd/instance"
 #define RIPNG_IFACE	"/frr-interface:lib/interface/frr-ripngd:ripng"
 
+DECLARE_MGROUP(RIPNGD);
+
 /* RIPng structure. */
 struct ripng {
 	RB_ENTRY(ripng) entry;
@@ -136,10 +137,7 @@ struct ripng {
 
 	/* RIPng threads. */
 	struct thread *t_read;
-	struct thread *t_write;
 	struct thread *t_update;
-	struct thread *t_garbage;
-	struct thread *t_zebra;
 
 	/* Triggered update hack. */
 	int trigger;
@@ -229,35 +227,6 @@ struct ripng_info {
 	struct agg_node *rp;
 };
 
-#ifdef notyet
-#if 0
-/* RIPng tag structure. */
-struct ripng_tag
-{
-  /* Tag value. */
-  uint16_t tag;
-
-  /* Port. */
-  uint16_t port;
-
-  /* Multicast group. */
-  struct in6_addr maddr;
-
-  /* Table number. */
-  int table;
-
-  /* Distance. */
-  int distance;
-
-  /* Split horizon. */
-  uint8_t split_horizon;
-
-  /* Poison reverse. */
-  uint8_t poison_reverse;
-};
-#endif /* 0 */
-#endif /* not yet */
-
 typedef enum {
 	RIPNG_NO_SPLIT_HORIZON = 0,
 	RIPNG_SPLIT_HORIZON,
@@ -292,13 +261,6 @@ struct ripng_interface {
 
 	/* Route-map. */
 	struct route_map *routemap[RIPNG_FILTER_MAX];
-
-#ifdef notyet
-#if 0
-  /* RIPng tag configuration. */
-  struct ripng_tag *rtag;
-#endif /* 0 */
-#endif /* notyet */
 
 	/* Default information originate. */
 	uint8_t default_originate;
@@ -349,14 +311,6 @@ enum ripng_event {
 
 /* RIPng timer on/off macro. */
 #define RIPNG_TIMER_ON(T,F,V) thread_add_timer (master, (F), rinfo, (V), &(T))
-
-#define RIPNG_TIMER_OFF(T)                                                     \
-	do {                                                                   \
-		if (T) {                                                       \
-			thread_cancel(T);                                      \
-			(T) = NULL;                                            \
-		}                                                              \
-	} while (0)
 
 #define RIPNG_OFFSET_LIST_IN  0
 #define RIPNG_OFFSET_LIST_OUT 1
@@ -468,20 +422,13 @@ extern int ripng_send_packet(caddr_t buf, int bufsize, struct sockaddr_in6 *to,
 extern void ripng_packet_dump(struct ripng_packet *packet, int size,
 			      const char *sndrcv);
 
-extern int ripng_interface_up(int command, struct zclient *, zebra_size_t,
-			      vrf_id_t);
-extern int ripng_interface_down(int command, struct zclient *, zebra_size_t,
-				vrf_id_t);
-extern int ripng_interface_add(int command, struct zclient *, zebra_size_t,
-			       vrf_id_t);
-extern int ripng_interface_delete(int command, struct zclient *, zebra_size_t,
-				  vrf_id_t);
-extern int ripng_interface_address_add(int command, struct zclient *,
-				       zebra_size_t, vrf_id_t);
-extern int ripng_interface_address_delete(int command, struct zclient *,
-					  zebra_size_t, vrf_id_t);
-extern int ripng_interface_vrf_update(int command, struct zclient *zclient,
-				      zebra_size_t length, vrf_id_t vrf_id);
+extern int ripng_interface_up(ZAPI_CALLBACK_ARGS);
+extern int ripng_interface_down(ZAPI_CALLBACK_ARGS);
+extern int ripng_interface_add(ZAPI_CALLBACK_ARGS);
+extern int ripng_interface_delete(ZAPI_CALLBACK_ARGS);
+extern int ripng_interface_address_add(ZAPI_CALLBACK_ARGS);
+extern int ripng_interface_address_delete(ZAPI_CALLBACK_ARGS);
+extern int ripng_interface_vrf_update(ZAPI_CALLBACK_ARGS);
 extern void ripng_interface_sync(struct interface *ifp);
 
 extern struct ripng *ripng_lookup_by_vrf_id(vrf_id_t vrf_id);
@@ -500,9 +447,6 @@ extern struct ripng_info *ripng_ecmp_delete(struct ripng *ripng,
 
 extern void ripng_vrf_init(void);
 extern void ripng_vrf_terminate(void);
-
-/* Northbound. */
 extern void ripng_cli_init(void);
-extern const struct frr_yang_module_info frr_ripngd_info;
 
 #endif /* _ZEBRA_RIPNG_RIPNGD_H */

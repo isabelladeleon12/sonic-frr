@@ -29,6 +29,7 @@
 #include "atomlist.h"
 #include "seqlock.h"
 #include "monotime.h"
+#include "printfrr.h"
 
 /*
  * maybe test:
@@ -40,18 +41,18 @@
 
 static struct seqlock sqlo;
 
-PREDECL_ATOMLIST(alist)
-PREDECL_ATOMSORT_UNIQ(asort)
+PREDECL_ATOMLIST(alist);
+PREDECL_ATOMSORT_UNIQ(asort);
 struct item {
 	uint64_t val1;
 	struct alist_item chain;
 	struct asort_item sortc;
 	uint64_t val2;
 };
-DECLARE_ATOMLIST(alist, struct item, chain)
+DECLARE_ATOMLIST(alist, struct item, chain);
 
 static int icmp(const struct item *a, const struct item *b);
-DECLARE_ATOMSORT_UNIQ(asort, struct item, sortc, icmp)
+DECLARE_ATOMSORT_UNIQ(asort, struct item, sortc, icmp);
 
 static int icmp(const struct item *a, const struct item *b)
 {
@@ -253,7 +254,7 @@ static void *thr1func(void *arg)
 	struct testrun *tr;
 
 	for (tr = runs; tr; tr = tr->next) {
-		sv = seqlock_bump(&p->sqlo);
+		sv = seqlock_bump(&p->sqlo) - SEQLOCK_INCR;
 		seqlock_wait(&sqlo, sv);
 
 		tr->func(offset);
@@ -288,14 +289,14 @@ static void run_tr(struct testrun *tr)
 	size_t c = 0, s = 0, n = 0;
 	struct item *item, *prev, dummy;
 
-	printf("[%02u] %35s %s\n", seqlock_cur(&sqlo) >> 1, "", desc);
+	printfrr("[%02u] %35s %s\n", seqlock_cur(&sqlo) >> 2, "", desc);
 	fflush(stdout);
 
 	if (tr->prefill != NOCLEAR)
 		clear_list(tr->prefill);
 
 	monotime(&tv);
-	sv = seqlock_bump(&sqlo);
+	sv = seqlock_bump(&sqlo) - SEQLOCK_INCR;
 	for (size_t i = 0; i < NTHREADS; i++) {
 		seqlock_wait(&thr[i].sqlo, seqlock_cur(&sqlo));
 		s += thr[i].counter;
@@ -308,7 +309,7 @@ static void run_tr(struct testrun *tr)
 	if (tr->sorted) {
 		uint64_t prevval = 0;
 
-		for_each(asort, &shead, item) {
+		frr_each(asort, &shead, item) {
 			assert(item->val1 >= prevval);
 			prevval = item->val1;
 			c++;
@@ -316,7 +317,7 @@ static void run_tr(struct testrun *tr)
 		assert(c == asort_count(&shead));
 	} else {
 		prev = &dummy;
-		for_each(alist, &ahead, item) {
+		frr_each(alist, &ahead, item) {
 			assert(item != prev);
 			prev = item;
 			c++;
@@ -324,8 +325,8 @@ static void run_tr(struct testrun *tr)
 		}
 		assert(c == alist_count(&ahead));
 	}
-	printf("\033[1A[%02u] %9"PRId64"us c=%5zu s=%5zu n=%5zu %s\n",
-		sv >> 1, delta, c, s, n, desc);
+	printfrr("\033[1A[%02u] %9"PRId64"us c=%5zu s=%5zu n=%5zu %s\n",
+		sv >> 2, delta, c, s, n, desc);
 }
 
 #ifdef BASIC_TESTS
@@ -334,9 +335,9 @@ static void dump(const char *lbl)
 	struct item *item, *safe;
 	size_t ctr = 0;
 
-	printf("dumping %s:\n", lbl);
-	for_each_safe(alist, &ahead, item) {
-		printf("%s %3zu %p %3"PRIu64" %3"PRIu64"\n", lbl, ctr++,
+	printfrr("dumping %s:\n", lbl);
+	frr_each_safe(alist, &ahead, item) {
+		printfrr("%s %3zu %p %3"PRIu64" %3"PRIu64"\n", lbl, ctr++,
 				(void *)item, item->val1, item->val2);
 	}
 }
@@ -362,12 +363,12 @@ static void basic_tests(void)
 	dump("");
 	alist_del(&ahead, &itm[1]);
 	dump("");
-	printf("POP: %p\n", alist_pop(&ahead));
+	printfrr("POP: %p\n", alist_pop(&ahead));
 	dump("");
-	printf("POP: %p\n", alist_pop(&ahead));
-	printf("POP: %p\n", alist_pop(&ahead));
-	printf("POP: %p\n", alist_pop(&ahead));
-	printf("POP: %p\n", alist_pop(&ahead));
+	printfrr("POP: %p\n", alist_pop(&ahead));
+	printfrr("POP: %p\n", alist_pop(&ahead));
+	printfrr("POP: %p\n", alist_pop(&ahead));
+	printfrr("POP: %p\n", alist_pop(&ahead));
 	dump("");
 }
 #else
@@ -381,7 +382,7 @@ int main(int argc, char **argv)
 	basic_tests();
 
 	seqlock_init(&sqlo);
-	seqlock_acquire_val(&sqlo, 1);
+	seqlock_acquire_val(&sqlo, SEQLOCK_STARTVAL);
 
 	for (i = 0; i < NTHREADS; i++) {
 		seqlock_init(&thr[i].sqlo);

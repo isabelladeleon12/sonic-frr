@@ -3,7 +3,7 @@
  *
  * Copyright (C) 2018 Christian Franke
  *
- * This file is part of FreeRangeRouting (FRR)
+ * This file is part of FRRouting (FRR)
  *
  * FRR is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -25,15 +25,14 @@
 #include "jhash.h"
 
 #include "isisd/isisd.h"
-#include "isisd/isis_memory.h"
 #include "isisd/isis_flags.h"
 #include "isisd/isis_circuit.h"
 #include "isisd/isis_lsp.h"
 #include "isisd/isis_misc.h"
 #include "isisd/isis_tx_queue.h"
 
-DEFINE_MTYPE_STATIC(ISISD, TX_QUEUE, "ISIS TX Queue")
-DEFINE_MTYPE_STATIC(ISISD, TX_QUEUE_ENTRY, "ISIS TX Queue Entry")
+DEFINE_MTYPE_STATIC(ISISD, TX_QUEUE, "ISIS TX Queue");
+DEFINE_MTYPE_STATIC(ISISD, TX_QUEUE_ENTRY, "ISIS TX Queue Entry");
 
 struct isis_tx_queue {
 	struct isis_circuit *circuit;
@@ -50,9 +49,9 @@ struct isis_tx_queue_entry {
 	struct isis_tx_queue *queue;
 };
 
-static unsigned tx_queue_hash_key(void *p)
+static unsigned tx_queue_hash_key(const void *p)
 {
-	struct isis_tx_queue_entry *e = p;
+	const struct isis_tx_queue_entry *e = p;
 
 	uint32_t id_key = jhash(e->lsp->hdr.lsp_id,
 				ISIS_SYS_ID_LEN + 2, 0x55aa5a5a);
@@ -93,8 +92,7 @@ static void tx_queue_element_free(void *element)
 {
 	struct isis_tx_queue_entry *e = element;
 
-	if (e->retry)
-		thread_cancel(e->retry);
+	THREAD_OFF(e->retry);
 
 	XFREE(MTYPE_TX_QUEUE_ENTRY, e);
 }
@@ -116,12 +114,11 @@ static struct isis_tx_queue_entry *tx_queue_find(struct isis_tx_queue *queue,
 	return hash_lookup(queue->hash, &e);
 }
 
-static int tx_queue_send_event(struct thread *thread)
+static void tx_queue_send_event(struct thread *thread)
 {
 	struct isis_tx_queue_entry *e = THREAD_ARG(thread);
 	struct isis_tx_queue *queue = e->queue;
 
-	e->retry = NULL;
 	thread_add_timer(master, tx_queue_send_event, e, 5, &e->retry);
 
 	if (e->is_retry)
@@ -131,8 +128,6 @@ static int tx_queue_send_event(struct thread *thread)
 
 	queue->send_event(queue->circuit, e->lsp, e->type);
 	/* Don't access e here anymore, send_event might have destroyed it */
-
-	return 0;
 }
 
 void _isis_tx_queue_add(struct isis_tx_queue *queue,
@@ -144,7 +139,7 @@ void _isis_tx_queue_add(struct isis_tx_queue *queue,
 	if (!queue)
 		return;
 
-	if (isis->debugs & DEBUG_TX_QUEUE) {
+	if (IS_DEBUG_TX_QUEUE) {
 		zlog_debug("Add LSP %s to %s queue as %s LSP. (From %s %s:%d)",
 			   rawlspid_print(lsp->hdr.lsp_id),
 			   queue->circuit->interface->name,
@@ -166,8 +161,7 @@ void _isis_tx_queue_add(struct isis_tx_queue *queue,
 
 	e->type = type;
 
-	if (e->retry)
-		thread_cancel(e->retry);
+	THREAD_OFF(e->retry);
 	thread_add_event(master, tx_queue_send_event, e, 0, &e->retry);
 
 	e->is_retry = false;
@@ -183,15 +177,14 @@ void _isis_tx_queue_del(struct isis_tx_queue *queue, struct isis_lsp *lsp,
 	if (!e)
 		return;
 
-	if (isis->debugs & DEBUG_TX_QUEUE) {
+	if (IS_DEBUG_TX_QUEUE) {
 		zlog_debug("Remove LSP %s from %s queue. (From %s %s:%d)",
 			   rawlspid_print(lsp->hdr.lsp_id),
 			   queue->circuit->interface->name,
 			   func, file, line);
 	}
 
-	if (e->retry)
-		thread_cancel(e->retry);
+	THREAD_OFF(e->retry);
 
 	hash_release(queue->hash, e);
 	XFREE(MTYPE_TX_QUEUE_ENTRY, e);

@@ -409,6 +409,25 @@ our $Operators	= qr{
 		  }x;
 
 our $c90_Keywords = qr{do|for|while|if|else|return|goto|continue|switch|default|case|break}x;
+our $Iterators	= qr{
+			frr_each|frr_each_safe|frr_each_from|
+			frr_with_mutex|frr_with_privs|
+			LIST_FOREACH|LIST_FOREACH_SAFE|
+			SLIST_FOREACH|SLIST_FOREACH_SAFE|SLIST_FOREACH_PREVPTR|
+			STAILQ_FOREACH|STAILQ_FOREACH_SAFE|
+			TAILQ_FOREACH|TAILQ_FOREACH_SAFE|TAILQ_FOREACH_REVERSE|TAILQ_FOREACH_REVERSE_SAFE|
+			RB_FOREACH|RB_FOREACH_SAFE|RB_FOREACH_REVERSE|RB_FOREACH_REVERSE_SAFE|
+			SPLAY_FOREACH|
+			FOR_ALL_INTERFACES|FOR_ALL_INTERFACES_ADDRESSES|JSON_FOREACH|
+			LY_FOR_KEYS|LY_LIST_FOR|LY_TREE_FOR|LY_TREE_DFS_BEGIN|LYD_TREE_DFS_BEGIN|
+			RE_DEST_FOREACH_ROUTE|RE_DEST_FOREACH_ROUTE_SAFE|
+			RNODE_FOREACH_RE|RNODE_FOREACH_RE_SAFE|
+			UPDGRP_FOREACH_SUBGRP|UPDGRP_FOREACH_SUBGRP_SAFE|
+			SUBGRP_FOREACH_PEER|SUBGRP_FOREACH_PEER_SAFE|
+			SUBGRP_FOREACH_ADJ|SUBGRP_FOREACH_ADJ_SAFE|
+			AF_FOREACH|FOREACH_AFI_SAFI|FOREACH_SAFI|
+			LSDB_LOOP
+		  }x;
 
 our $BasicType;
 our $NonptrType;
@@ -1009,9 +1028,9 @@ sub top_of_kernel_tree {
 	my ($root) = @_;
 
 	my @tree_check = (
-		"COPYING", "CREDITS", "Kbuild", "MAINTAINERS", "Makefile",
-		"README", "Documentation", "arch", "include", "drivers",
-		"fs", "init", "ipc", "kernel", "lib", "scripts",
+		"COPYING", "configure.ac", "Makefile.am",
+		"README.md", "doc", "lib", "vtysh", "watchfrr", "tests",
+		"zebra", "bgpd", "ospfd", "ospf6d", "isisd", "staticd",
 	);
 
 	foreach my $check (@tree_check) {
@@ -2655,8 +2674,8 @@ sub process {
 		      (defined($1) || defined($2))))) {
 			$is_patch = 1;
 			$reported_maintainer_file = 1;
-			WARN("FILE_PATH_CHANGES",
-			     "added, moved or deleted file(s), does MAINTAINERS need updating?\n" . $herecurr);
+			#WARN("FILE_PATH_CHANGES",
+			#     "added, moved or deleted file(s), does MAINTAINERS need updating?\n" . $herecurr);
 		}
 
 # Check for wrappage within a valid hunk of the file
@@ -3351,7 +3370,7 @@ sub process {
 
 # if/while/etc brace do not go on next line, unless defining a do while loop,
 # or if that brace on the next line is for something else
-		if ($line =~ /(.*)\b((?:if|while|for|switch|(?:[a-z_]+|)for_each[a-z_]+)\s*\(|do\b|else\b)/ && $line !~ /^.\s*\#/) {
+		if ($line =~ /(.*)\b((?:if|while|for|switch|(?:[a-z_]+|)frr_(each|with)[a-z_]+)\s*\(|do\b|else\b)/ && $line !~ /^.\s*\#/) {
 			my $pre_ctx = "$1$2";
 
 			my ($level, @ctx) = ctx_statement_level($linenr, $realcnt, 0);
@@ -3397,7 +3416,7 @@ sub process {
 		}
 
 # Check relative indent for conditionals and blocks.
-		if ($line =~ /\b(?:(?:if|while|for|(?:[a-z_]+|)for_each[a-z_]+)\s*\(|(?:do|else)\b)/ && $line !~ /^.\s*#/ && $line !~ /\}\s*while\s*/) {
+		if ($line =~ /\b(?:(?:if|while|for|(?:[a-z_]+|)frr_(each|with)[a-z_]+)\s*\(|(?:do|else)\b)/ && $line !~ /^.\s*#/ && $line !~ /\}\s*while\s*/) {
 			($stat, $cond, $line_nr_next, $remain_next, $off_next) =
 				ctx_statement_block($linenr, $realcnt, 0)
 					if (!defined $stat);
@@ -4028,7 +4047,8 @@ sub process {
 				if|for|while|switch|return|case|
 				volatile|__volatile__|
 				__attribute__|format|__extension__|
-				asm|__asm__)$/x)
+				asm|__asm__|
+				$Iterators)$/x)
 			{
 			# cpp #define statements have non-optional spaces, ie
 			# if there is a space between the name and the open
@@ -5177,6 +5197,31 @@ sub process {
 			}
 		}
 
+		if (!defined $suppress_ifbraces{$linenr - 1} &&
+					$line =~ /\b(frr_with_)/) {
+			my ($level, $endln, @chunks) =
+				ctx_statement_full($linenr, $realcnt, $-[0]);
+
+			# Check the condition.
+			my ($cond, $block) = @{$chunks[0]};
+			#print "CHECKING<$linenr> cond<$cond> block<$block>\n";
+			if (defined $cond) {
+				substr($block, 0, length($cond), '');
+			}
+
+			if ($level == 0 && $block !~ /^\s*\{/) {
+				my $herectx = $here . "\n";
+				my $cnt = statement_rawlines($block);
+
+				for (my $n = 0; $n < $cnt; $n++) {
+					$herectx .= raw_line($linenr, $n) . "\n";
+				}
+
+				WARN("BRACES",
+				     "braces {} are mandatory for frr_with_* blocks\n" . $herectx);
+			}
+		}
+
 # check for single line unbalanced braces
 		if ($sline =~ /^.\s*\}\s*else\s*$/ ||
 		    $sline =~ /^.\s*else\s*\{\s*$/) {
@@ -5275,8 +5320,8 @@ sub process {
 
 # uncoalesced string fragments
 		if ($line =~ /$String\s*"/) {
-			WARN("STRING_FRAGMENTS",
-			     "Consecutive strings are generally better as a single string\n" . $herecurr);
+			CHK("STRING_FRAGMENTS",
+			    "Consecutive strings are generally better as a single string\n" . $herecurr);
 		}
 
 # check for non-standard and hex prefixed decimal printf formats
@@ -5744,7 +5789,7 @@ sub process {
 		}
 
 		# check for vsprintf extension %p<foo> misuses
-		if ($^V && $^V ge 5.10.0 &&
+		if (0 && $^V && $^V ge 5.10.0 &&
 		    defined $stat &&
 		    $stat =~ /^\+(?![^\{]*\{\s*).*\b(\w+)\s*\(.*$String\s*,/s &&
 		    $1 !~ /^_*volatile_*$/) {
@@ -6347,6 +6392,35 @@ sub process {
 			     "Please, only use 32 bit atomics.\n" . $herecurr);
 		}
 
+# check for use of strcpy()
+		if ($line =~ /\bstrcpy\s*\(.*\)/) {
+			ERROR("STRCPY",
+			      "strcpy() is error-prone; please use strlcpy()"  . $herecurr);
+		}
+
+# check for use of strncpy()
+		if ($line =~ /\bstrncpy\s*\(.*\)/) {
+			WARN("STRNCPY",
+			     "strncpy() is error-prone; please use strlcpy() if possible, or memcpy()"  . $herecurr);
+		}
+
+# check for use of strcat()
+		if ($line =~ /\bstrcat\s*\(.*\)/) {
+			ERROR("STRCAT",
+			      "strcat() is error-prone; please use strlcat() if possible"  . $herecurr);
+		}
+
+# check for use of strncat()
+		if ($line =~ /\bstrncat\s*\(.*\)/) {
+			WARN("STRNCAT",
+			     "strncat() is error-prone; please use strlcat() if possible"  . $herecurr);
+		}
+
+# check for use of bzero()
+		if ($line =~ /\bbzero\s*\(.*\)/) {
+			ERROR("BZERO",
+			      "bzero() is deprecated; use memset()"  . $herecurr);
+		}
 	}
 
 	# If we have no input at all, then there is nothing to report on
